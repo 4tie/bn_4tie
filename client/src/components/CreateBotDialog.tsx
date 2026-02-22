@@ -1,0 +1,103 @@
+import { useState } from "react";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+import { 
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter 
+} from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Plus } from "lucide-react";
+import { useCreateBot } from "@/hooks/use-trading-api";
+import { useToast } from "@/hooks/use-toast";
+
+// Mimicking the backend insertBotSchema
+const formSchema = z.object({
+  name: z.string().min(1, "Name is required"),
+  symbols: z.string().transform(s => s.split(',').map(str => str.trim().toUpperCase())),
+  timeframe: z.string().min(1, "Timeframe required (e.g. 1h)"),
+  strategy: z.string().min(1, "Strategy required"),
+});
+
+export function CreateBotDialog() {
+  const [open, setOpen] = useState(false);
+  const { toast } = useToast();
+  const createBot = useCreateBot();
+  
+  const form = useForm<z.infer<typeof formSchema>>({
+    resolver: zodResolver(formSchema),
+    defaultValues: {
+      name: "",
+      symbols: [] as any,
+      timeframe: "1h",
+      strategy: "RSI_MACD",
+    }
+  });
+
+  const onSubmit = (data: z.infer<typeof formSchema>) => {
+    createBot.mutate({
+      ...data,
+      paperMode: true,
+      knobs: {
+        max_open_trades: 3,
+        stake_amount: 100,
+        stop_loss_pct: 0.05,
+        take_profit_pct: 0.1,
+        cooldown_minutes: 60
+      }
+    }, {
+      onSuccess: () => {
+        toast({ title: "Bot Created", description: `Successfully created ${data.name}` });
+        setOpen(false);
+        form.reset();
+      },
+      onError: (err) => {
+        toast({ title: "Error", description: err.message, variant: "destructive" });
+      }
+    });
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        <Button className="bg-primary hover:bg-primary/90 text-white shadow-lg shadow-primary/20">
+          <Plus className="w-4 h-4 mr-2" />
+          Deploy New Bot
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="sm:max-w-[425px] bg-card border-border/50 shadow-2xl shadow-black">
+        <DialogHeader>
+          <DialogTitle className="text-xl">Deploy Trading Bot</DialogTitle>
+        </DialogHeader>
+        <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4 py-4">
+          <div className="space-y-2">
+            <Label htmlFor="name">Bot Name</Label>
+            <Input id="name" placeholder="e.g. BTC Scalper" className="bg-background" {...form.register("name")} />
+            {form.formState.errors.name && <p className="text-xs text-danger">{form.formState.errors.name.message}</p>}
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="symbols">Symbols (comma separated)</Label>
+            <Input id="symbols" placeholder="BTC/USDT, ETH/USDT" className="bg-background" {...form.register("symbols")} />
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <Label htmlFor="timeframe">Timeframe</Label>
+              <Input id="timeframe" placeholder="1h, 4h, 1d" className="bg-background" {...form.register("timeframe")} />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="strategy">Strategy</Label>
+              <Input id="strategy" placeholder="RSI_MACD" className="bg-background" {...form.register("strategy")} />
+            </div>
+          </div>
+          <DialogFooter className="pt-4">
+            <Button type="button" variant="outline" onClick={() => setOpen(false)} className="border-border/50">Cancel</Button>
+            <Button type="submit" disabled={createBot.isPending} className="bg-primary hover:bg-primary/90 text-white">
+              {createBot.isPending ? "Deploying..." : "Deploy"}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
