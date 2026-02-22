@@ -1,19 +1,45 @@
-from fastapi import FastAPI, Depends, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
-from typing import List, Optional
-import os
+from __future__ import annotations
+
 import asyncio
 import json
-from sse_starlette.sse import EventSourceResponse
+from collections.abc import AsyncGenerator
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
-from packages.core.models import Bot, Trade, Order, PortfolioSnapshot, Job
-from packages.core.schemas import BotCreate, BotRead, PortfolioSnapshotRead, TradeRead, OrderRead, JobRead, Knobs
-from apps.api.database import get_db
+import ccxt
 import redis.asyncio as redis
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from sse_starlette.sse import EventSourceResponse
+from sqlalchemy import desc, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
-app = FastAPI(title="Binance Bot Platform")
+from apps.api.database import get_db
+from apps.worker.celery_app import celery_app
+from packages.core.models import Bot, Job, Order, PortfolioSnapshot, Trade
+from packages.core.schemas import (
+    BotCreate,
+    BotKnobsUpdate,
+    BotRead,
+    BotStartResponse,
+    BotStopResponse,
+    JobRead,
+    MarketOhlcvResponse,
+    MarketTicker,
+    OllamaModel,
+    OrderRead,
+    PortfolioSnapshotRead,
+    TradeRead,
+)
+from packages.core.settings import get_settings
+
+settings = get_settings()
+
+app = FastAPI(title="Local-First Binance Bot API", version="1.0.0")
+router = APIRouter()
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,142 +49,410 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-async def redis_listener(bot_id: Optional[str], job_id: Optional[str]):
+def _serialize_json(value: Any) -> str:
+    return json.dumps(value, default=_json_default)
+
+
+def _json_default(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def _parse_symbols(symbols: str) -> list[str]:
+    parsed = [symbol.strip().upper() for symbol in symbols.split(",") if symbol.strip()]
+    if not parsed:
+        raise HTTPException(status_code=422, detail="At least one symbol is required")
+
+    invalid = [symbol for symbol in parsed if "/" not in symbol]
+    if invalid:
+        raise HTTPException(status_code=422, detail=f"Invalid symbol values: {', '.join(invalid)}")
+
+    return parsed
+
+
+def _fetch_binance_tickers(symbols: list[str]) -> list[dict[str, Any]]:
+    exchange = ccxt.binance({"enableRateLimit": True})
     try:
-        r = redis.from_url(REDIS_URL)
-        pubsub = r.pubsub()
-        await pubsub.subscribe("events")
-        yield {"event": "system.notice", "data": json.dumps({"message": "Connected"})}
-        async for message in pubsub.listen():
-            if message["type"] == "message":
-                data = json.loads(message["data"])
-                # optional filtering
-                yield {
-                    "event": data.get("event", "message"),
-                    "data": json.dumps(data.get("data", {}))
+        exchange.load_markets()
+        tickers: dict[str, Any]
+        try:
+            tickers = exchange.fetch_tickers(symbols)
+        except Exception:
+            tickers = {symbol: exchange.fetch_ticker(symbol) for symbol in symbols}
+
+        payload: list[dict[str, Any]] = []
+        for symbol in symbols:
+            ticker = tickers.get(symbol)
+            if not ticker:
+                continue
+
+            last_price = ticker.get("last") or ticker.get("close")
+            if last_price is None:
+                continue
+
+            payload.append(
+                {
+                    "symbol": symbol,
+                    "price": float(last_price),
+                    "change_24h": (
+                        float(ticker["percentage"]) if ticker.get("percentage") is not None else None
+                    ),
+                    "timestamp": ticker.get("timestamp"),
                 }
+            )
+
+        if not payload:
+            raise RuntimeError("No ticker data returned from Binance")
+
+        return payload
+    finally:
+        close_method = getattr(exchange, "close", None)
+        if callable(close_method):
+            close_method()
+
+
+def _fetch_binance_ohlcv(symbol: str, timeframe: str, limit: int) -> list[list[float | int]]:
+    exchange = ccxt.binance({"enableRateLimit": True})
+    try:
+        exchange.load_markets()
+        rows = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        if not rows:
+            raise RuntimeError("No OHLCV data returned from Binance")
+        return rows
+    finally:
+        close_method = getattr(exchange, "close", None)
+        if callable(close_method):
+            close_method()
+
+
+def _ollama_get(path: str) -> tuple[int, dict[str, Any]]:
+    base = settings.ollama_base_url.rstrip("/")
+    req = urlrequest.Request(f"{base}{path}", headers={"Accept": "application/json"})
+    with urlrequest.urlopen(req, timeout=5) as response:
+        body = response.read().decode("utf-8")
+        parsed: dict[str, Any] = json.loads(body) if body else {}
+        return response.status, parsed
+
+
+async def _redis_sse_stream(
+    request: Request,
+    bot_id: int | None,
+    job_id: int | None,
+) -> AsyncGenerator[dict[str, str], None]:
+    client = redis.from_url(settings.redis_url, decode_responses=True)
+    pubsub = client.pubsub()
+
+    await pubsub.subscribe("events")
+    yield {
+        "event": "system.notice",
+        "data": _serialize_json(
+            {
+                "message": "SSE connected",
+                "channel": "events",
+                "ts": datetime.utcnow().isoformat() + "Z",
+            }
+        ),
+    }
+
+    try:
+        while True:
+            if await request.is_disconnected():
+                break
+
+            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+            if not message:
+                await asyncio.sleep(0.1)
+                continue
+
+            raw_data = message.get("data")
+            if raw_data is None:
+                continue
+
+            try:
+                payload = json.loads(raw_data)
+            except json.JSONDecodeError:
+                continue
+
+            event_name = str(payload.get("event", "system.notice"))
+            event_data = payload.get("data", {})
+            if not isinstance(event_data, dict):
+                event_data = {"value": event_data}
+
+            if bot_id is not None and event_data.get("bot_id") != bot_id:
+                continue
+            if job_id is not None and event_data.get("job_id") != job_id:
+                continue
+
+            yield {"event": event_name, "data": _serialize_json(event_data)}
     finally:
         await pubsub.unsubscribe("events")
-        await r.aclose()
+        await pubsub.close()
+        await client.aclose()
 
-@app.get("/api/health")
-async def health(db: AsyncSession = Depends(get_db)):
+
+@app.on_event("startup")
+async def startup() -> None:
+    Path(settings.artifacts_dir).mkdir(parents=True, exist_ok=True)
+
+
+@router.get("/health")
+async def health(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    checks: dict[str, dict[str, Any]] = {}
+
     try:
-        await db.execute(select(1))
-        db_status = "ok"
-    except Exception:
-        db_status = "error"
-    
+        await db.execute(text("SELECT 1"))
+        checks["db"] = {"ok": True}
+    except Exception as exc:  # pragma: no cover - runtime dependent
+        checks["db"] = {"ok": False, "error": str(exc)}
+
     try:
-        r = redis.from_url(REDIS_URL)
-        await r.ping()
-        redis_status = "ok"
-        await r.aclose()
-    except Exception:
-        redis_status = "error"
+        redis_client = redis.from_url(settings.redis_url)
+        await redis_client.ping()
+        await redis_client.aclose()
+        checks["redis"] = {"ok": True}
+    except Exception as exc:  # pragma: no cover - runtime dependent
+        checks["redis"] = {"ok": False, "error": str(exc)}
 
-    return {"status": "ok", "db": db_status, "redis": redis_status}
+    artifacts_path = Path(settings.artifacts_dir)
+    checks["artifacts"] = {
+        "ok": artifacts_path.exists() and artifacts_path.is_dir(),
+        "path": str(artifacts_path),
+    }
 
-@app.get("/api/sse")
-async def sse(req: Request, bot_id: Optional[str] = None, job_id: Optional[str] = None):
-    return EventSourceResponse(redis_listener(bot_id, job_id))
+    overall_ok = all(item.get("ok") for item in checks.values())
+    return {
+        "status": "ok" if overall_ok else "degraded",
+        "checks": checks,
+    }
 
-@app.get("/api/bots", response_model=List[BotRead])
-async def get_bots(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Bot))
-    return result.scalars().all()
 
-@app.post("/api/bots", response_model=BotRead, status_code=201)
-async def create_bot(bot: BotCreate, db: AsyncSession = Depends(get_db)):
-    new_bot = Bot(**bot.model_dump())
-    db.add(new_bot)
-    await db.commit()
-    await db.refresh(new_bot)
-    return new_bot
+@router.get("/sse")
+async def sse(
+    request: Request,
+    bot_id: int | None = Query(default=None),
+    job_id: int | None = Query(default=None),
+) -> EventSourceResponse:
+    return EventSourceResponse(_redis_sse_stream(request=request, bot_id=bot_id, job_id=job_id), ping=15)
 
-@app.get("/api/bots/{id}", response_model=BotRead)
-async def get_bot(id: int, db: AsyncSession = Depends(get_db)):
-    bot = await db.get(Bot, id)
-    if not bot:
-        raise HTTPException(status_code=404, detail="Bot not found")
-    return bot
 
-@app.post("/api/bots/{id}/start")
-async def start_bot(id: int, db: AsyncSession = Depends(get_db)):
-    bot = await db.get(Bot, id)
-    if not bot:
-        raise HTTPException(status_code=404, detail="Bot not found")
-    bot.status = "running"
-    await db.commit()
-    
-    from apps.worker.celery_app import celery_app
-    celery_app.send_task("bot_run_loop", args=[id])
-    
-    return {"status": "started"}
+@router.get("/market/tickers", response_model=list[MarketTicker])
+async def market_tickers(symbols: str = Query(..., description="Comma-separated symbols")) -> list[MarketTicker]:
+    parsed_symbols = _parse_symbols(symbols)
+    try:
+        data = await asyncio.to_thread(_fetch_binance_tickers, parsed_symbols)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch Binance tickers: {exc}") from exc
 
-@app.post("/api/bots/{id}/stop")
-async def stop_bot(id: int, db: AsyncSession = Depends(get_db)):
-    bot = await db.get(Bot, id)
-    if not bot:
-        raise HTTPException(status_code=404, detail="Bot not found")
-    bot.status = "stopped"
-    await db.commit()
-    
-    from apps.worker.celery_app import celery_app
-    celery_app.send_task("bot_stop", args=[id])
-    
-    return {"status": "stopped"}
+    return [MarketTicker.model_validate(item) for item in data]
 
-@app.post("/api/bots/{id}/knobs", response_model=BotRead)
-async def update_bot_knobs(id: int, knobs: Knobs, db: AsyncSession = Depends(get_db)):
-    bot = await db.get(Bot, id)
-    if not bot:
-        raise HTTPException(status_code=404, detail="Bot not found")
-    bot.knobs = knobs.model_dump()
+
+@router.get("/market/ohlcv", response_model=MarketOhlcvResponse)
+async def market_ohlcv(
+    symbol: str = Query(..., description="Trading pair such as BTC/USDT"),
+    timeframe: str = Query(default="1h"),
+    limit: int = Query(default=500, ge=1, le=1000),
+) -> MarketOhlcvResponse:
+    normalized_symbol = symbol.strip().upper()
+    if "/" not in normalized_symbol:
+        raise HTTPException(status_code=422, detail="symbol must look like BASE/QUOTE, e.g. BTC/USDT")
+
+    try:
+        rows = await asyncio.to_thread(_fetch_binance_ohlcv, normalized_symbol, timeframe, limit)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch Binance OHLCV: {exc}") from exc
+
+    return MarketOhlcvResponse(symbol=normalized_symbol, timeframe=timeframe, limit=limit, ohlcv=rows)
+
+
+@router.get("/ai/models", response_model=list[OllamaModel])
+async def ai_models() -> list[OllamaModel]:
+    try:
+        status_code, payload = await asyncio.to_thread(_ollama_get, "/api/tags")
+    except (urlerror.URLError, TimeoutError, ConnectionError) as exc:
+        raise HTTPException(status_code=503, detail=f"Ollama unavailable: {exc}") from exc
+
+    if status_code >= 400:
+        raise HTTPException(status_code=503, detail=f"Ollama returned HTTP {status_code}")
+
+    raw_models = payload.get("models", [])
+    if not isinstance(raw_models, list):
+        raise HTTPException(status_code=502, detail="Unexpected Ollama response format")
+
+    return [OllamaModel.model_validate(item) for item in raw_models]
+
+
+@router.get("/ai/health")
+async def ai_health() -> dict[str, Any]:
+    try:
+        status_code, payload = await asyncio.to_thread(_ollama_get, "/api/tags")
+        return {
+            "status": "ok" if status_code < 400 else "error",
+            "http_status": status_code,
+            "models_count": len(payload.get("models", [])) if isinstance(payload.get("models"), list) else None,
+            "base_url": settings.ollama_base_url,
+        }
+    except Exception as exc:  # pragma: no cover - runtime dependent
+        return {
+            "status": "error",
+            "base_url": settings.ollama_base_url,
+            "error": str(exc),
+        }
+
+
+@router.post("/bots", response_model=BotRead, status_code=201)
+async def create_bot(payload: BotCreate, db: AsyncSession = Depends(get_db)) -> BotRead:
+    bot = Bot(
+        name=payload.name,
+        symbols=payload.symbols,
+        timeframe=payload.timeframe,
+        paper_mode=payload.paper_mode,
+        strategy=payload.strategy,
+        knobs=payload.knobs.model_dump(),
+        status="stopped",
+        stop_requested=False,
+    )
+    db.add(bot)
     await db.commit()
     await db.refresh(bot)
-    return bot
+    return BotRead.model_validate(bot)
 
-@app.get("/api/portfolio", response_model=PortfolioSnapshotRead)
-async def get_global_portfolio(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(PortfolioSnapshot).where(PortfolioSnapshot.bot_id == None).order_by(PortfolioSnapshot.timestamp.desc()).limit(1))
-    p = result.scalars().first()
-    if not p:
-        raise HTTPException(status_code=404, detail="No global portfolio found")
-    return p
 
-@app.get("/api/portfolio/{bot_id}", response_model=PortfolioSnapshotRead)
-async def get_bot_portfolio(bot_id: int, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(PortfolioSnapshot).where(PortfolioSnapshot.bot_id == bot_id).order_by(PortfolioSnapshot.timestamp.desc()).limit(1))
-    p = result.scalars().first()
-    if not p:
-        raise HTTPException(status_code=404, detail="No portfolio found for bot")
-    return p
+@router.get("/bots", response_model=list[BotRead])
+async def list_bots(db: AsyncSession = Depends(get_db)) -> list[BotRead]:
+    result = await db.execute(select(Bot).order_by(desc(Bot.created_at)))
+    return [BotRead.model_validate(bot) for bot in result.scalars().all()]
 
-@app.get("/api/trades", response_model=List[TradeRead])
-async def get_trades(status: Optional[str] = None, db: AsyncSession = Depends(get_db)):
-    q = select(Trade)
+
+@router.get("/bots/{bot_id}", response_model=BotRead)
+async def get_bot(bot_id: int, db: AsyncSession = Depends(get_db)) -> BotRead:
+    bot = await db.get(Bot, bot_id)
+    if not bot:
+        raise HTTPException(status_code=404, detail="Bot not found")
+    return BotRead.model_validate(bot)
+
+
+@router.post("/bots/{bot_id}/start", response_model=BotStartResponse)
+async def start_bot(bot_id: int, db: AsyncSession = Depends(get_db)) -> BotStartResponse:
+    bot = await db.get(Bot, bot_id)
+    if not bot:
+        raise HTTPException(status_code=404, detail="Bot not found")
+
+    bot.status = "running"
+    bot.stop_requested = False
+
+    job = Job(bot_id=bot_id, task="bot_run_loop", status="queued", progress=0, message="Queued")
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+
+    try:
+        async_result = celery_app.send_task("bot_run_loop", args=[bot_id])
+    except Exception as exc:
+        job.status = "failed"
+        job.message = f"Failed to enqueue task: {exc}"
+        bot.status = "stopped"
+        bot.stop_requested = True
+        await db.commit()
+        raise HTTPException(status_code=503, detail=f"Failed to enqueue worker task: {exc}") from exc
+
+    job.celery_task_id = async_result.id
+    await db.commit()
+
+    return BotStartResponse(bot_id=bot_id, job_id=job.id, task_id=async_result.id, status="queued")
+
+
+@router.post("/bots/{bot_id}/stop", response_model=BotStopResponse)
+async def stop_bot(bot_id: int, db: AsyncSession = Depends(get_db)) -> BotStopResponse:
+    bot = await db.get(Bot, bot_id)
+    if not bot:
+        raise HTTPException(status_code=404, detail="Bot not found")
+
+    bot.status = "stopped"
+    bot.stop_requested = True
+
+    stop_job = Job(bot_id=bot_id, task="bot_stop", status="queued", progress=0, message="Stop requested")
+    db.add(stop_job)
+    await db.commit()
+
+    try:
+        celery_app.send_task("bot_stop", args=[bot_id])
+    except Exception as exc:
+        stop_job.status = "failed"
+        stop_job.message = f"Failed to enqueue stop task: {exc}"
+        await db.commit()
+        raise HTTPException(status_code=503, detail=f"Failed to enqueue stop task: {exc}") from exc
+
+    return BotStopResponse(bot_id=bot_id, stop_requested=True, status="stopped")
+
+
+@router.post("/bots/{bot_id}/knobs", response_model=BotRead)
+async def update_bot_knobs(bot_id: int, payload: BotKnobsUpdate, db: AsyncSession = Depends(get_db)) -> BotRead:
+    bot = await db.get(Bot, bot_id)
+    if not bot:
+        raise HTTPException(status_code=404, detail="Bot not found")
+
+    bot.knobs = payload.knobs.model_dump()
+    await db.commit()
+    await db.refresh(bot)
+    return BotRead.model_validate(bot)
+
+
+@router.get("/portfolio", response_model=PortfolioSnapshotRead)
+async def get_latest_portfolio(db: AsyncSession = Depends(get_db)) -> PortfolioSnapshotRead:
+    result = await db.execute(select(PortfolioSnapshot).order_by(desc(PortfolioSnapshot.timestamp)).limit(1))
+    snapshot = result.scalars().first()
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="No portfolio snapshots found")
+
+    return PortfolioSnapshotRead.model_validate(snapshot)
+
+
+@router.get("/portfolio/{bot_id}", response_model=PortfolioSnapshotRead)
+async def get_bot_portfolio(bot_id: int, db: AsyncSession = Depends(get_db)) -> PortfolioSnapshotRead:
+    result = await db.execute(
+        select(PortfolioSnapshot)
+        .where(PortfolioSnapshot.bot_id == bot_id)
+        .order_by(desc(PortfolioSnapshot.timestamp))
+        .limit(1)
+    )
+    snapshot = result.scalars().first()
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="No portfolio snapshots found for bot")
+
+    return PortfolioSnapshotRead.model_validate(snapshot)
+
+
+@router.get("/jobs", response_model=list[JobRead])
+async def list_jobs(db: AsyncSession = Depends(get_db)) -> list[JobRead]:
+    result = await db.execute(select(Job).order_by(desc(Job.created_at)))
+    return [JobRead.model_validate(job) for job in result.scalars().all()]
+
+
+@router.get("/jobs/{job_id}", response_model=JobRead)
+async def get_job(job_id: int, db: AsyncSession = Depends(get_db)) -> JobRead:
+    job = await db.get(Job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return JobRead.model_validate(job)
+
+
+@router.get("/trades", response_model=list[TradeRead])
+async def list_trades(status: str | None = Query(default=None), db: AsyncSession = Depends(get_db)) -> list[TradeRead]:
+    query = select(Trade).order_by(desc(Trade.created_at))
     if status:
-        q = q.where(Trade.status == status)
-    result = await db.execute(q)
-    return result.scalars().all()
+        query = query.where(Trade.status == status)
 
-@app.get("/api/orders", response_model=List[OrderRead])
-async def get_orders(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Order))
-    return result.scalars().all()
+    result = await db.execute(query)
+    return [TradeRead.model_validate(trade) for trade in result.scalars().all()]
 
-@app.get("/api/jobs", response_model=List[JobRead])
-async def get_jobs(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Job))
-    return result.scalars().all()
 
-@app.get("/api/market/tickers")
-async def get_market_tickers(symbols: Optional[str] = None):
-    return []
+@router.get("/orders", response_model=list[OrderRead])
+async def list_orders(db: AsyncSession = Depends(get_db)) -> list[OrderRead]:
+    result = await db.execute(select(Order).order_by(desc(Order.created_at)))
+    return [OrderRead.model_validate(order) for order in result.scalars().all()]
 
-@app.get("/api/ai/models")
-async def get_ai_models():
-    return [{"name": "llama3:8b"}, {"name": "mistral:7b"}]
+
+app.include_router(router)
+app.include_router(router, prefix="/api")

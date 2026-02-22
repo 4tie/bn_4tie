@@ -1,50 +1,55 @@
 import { useEffect } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { api } from "@shared/routes";
 
-// Listen to Server-Sent Events to invalidate caches and trigger UI updates
+const apiBase = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
+const ssePath = `${apiBase}/api/sse`;
+
 export function useRealtimeUpdates() {
   const queryClient = useQueryClient();
 
   useEffect(() => {
-    // SSE endpoint defined in routes.ts
-    const eventSource = new EventSource(api.sse.path);
+    const eventSource = new EventSource(ssePath);
 
-    eventSource.onmessage = (event) => {
+    const handleBotState = (event: MessageEvent) => {
       try {
         const data = JSON.parse(event.data);
-        
-        switch (data.type) {
-          case 'bot.state':
-            queryClient.invalidateQueries({ queryKey: [api.bots.list.path] });
-            if (data.botId) {
-              queryClient.invalidateQueries({ queryKey: [api.bots.get.path, data.botId] });
-            }
-            break;
-          case 'portfolio.snapshot':
-            queryClient.invalidateQueries({ queryKey: [api.portfolio.getGlobal.path] });
-            break;
-          case 'job.progress':
-            queryClient.invalidateQueries({ queryKey: [api.jobs.list.path] });
-            break;
-          case 'trade.update':
-            queryClient.invalidateQueries({ queryKey: [api.trades.list.path] });
-            break;
-          case 'market.tick':
-            queryClient.invalidateQueries({ queryKey: [api.market.tickers.path] });
-            break;
+        queryClient.invalidateQueries({ queryKey: ["/api/bots"] });
+        if (data?.bot_id) {
+          queryClient.invalidateQueries({ queryKey: ["/api/bots", data.bot_id] });
         }
       } catch (err) {
-        console.error("Failed to parse SSE message", err);
+        console.error("Failed to parse bot.state payload", err);
       }
     };
 
+    const handlePortfolio = (event: MessageEvent) => {
+      try {
+        const data = JSON.parse(event.data);
+        queryClient.invalidateQueries({ queryKey: ["/api/portfolio"] });
+        if (data?.bot_id) {
+          queryClient.invalidateQueries({ queryKey: ["/api/portfolio", data.bot_id] });
+        }
+      } catch (err) {
+        console.error("Failed to parse portfolio.snapshot payload", err);
+      }
+    };
+
+    const handleJobProgress = () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/jobs"] });
+    };
+
+    eventSource.addEventListener("bot.state", handleBotState);
+    eventSource.addEventListener("portfolio.snapshot", handlePortfolio);
+    eventSource.addEventListener("job.progress", handleJobProgress);
+
     eventSource.onerror = (err) => {
       console.error("SSE connection error", err);
-      // EventSource automatically attempts to reconnect
     };
 
     return () => {
+      eventSource.removeEventListener("bot.state", handleBotState);
+      eventSource.removeEventListener("portfolio.snapshot", handlePortfolio);
+      eventSource.removeEventListener("job.progress", handleJobProgress);
       eventSource.close();
     };
   }, [queryClient]);

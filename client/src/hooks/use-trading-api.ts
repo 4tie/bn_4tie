@@ -1,128 +1,232 @@
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { api, buildUrl } from "@shared/routes";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { z } from "zod";
 
-// --- FETCHERS ---
+const apiBase = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
+const apiUrl = (path: string) => `${apiBase}${path}`;
+
+const knobsSchema = z.object({
+  max_open_trades: z.number(),
+  stake_amount: z.number(),
+  stop_loss_pct: z.number(),
+  take_profit_pct: z.number(),
+  cooldown_minutes: z.number(),
+});
+
+const botSchema = z.object({
+  id: z.number(),
+  name: z.string(),
+  symbols: z.array(z.string()),
+  timeframe: z.string(),
+  paper_mode: z.boolean(),
+  strategy: z.string(),
+  knobs: knobsSchema,
+  status: z.string(),
+  stop_requested: z.boolean(),
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+
+const tradeSchema = z.object({
+  id: z.number(),
+  bot_id: z.number(),
+  symbol: z.string(),
+  side: z.string(),
+  amount: z.number(),
+  price: z.number(),
+  status: z.string(),
+  pnl: z.number().nullable(),
+  created_at: z.string(),
+});
+
+const portfolioSchema = z.object({
+  id: z.number(),
+  bot_id: z.number().nullable(),
+  equity: z.number(),
+  cash: z.number(),
+  positions_value: z.number(),
+  timestamp: z.string(),
+});
+
+const tickerSchema = z.object({
+  symbol: z.string(),
+  price: z.number(),
+  change_24h: z.number().nullable().optional(),
+  timestamp: z.number().nullable().optional(),
+});
+
+const jobSchema = z.object({
+  id: z.number(),
+  bot_id: z.number().nullable(),
+  task: z.string(),
+  status: z.string(),
+  progress: z.number(),
+  message: z.string().nullable().optional(),
+  celery_task_id: z.string().nullable().optional(),
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+
+const startBotResponseSchema = z.object({
+  bot_id: z.number(),
+  job_id: z.number(),
+  task_id: z.string().nullable(),
+  status: z.string(),
+});
+
+const stopBotResponseSchema = z.object({
+  bot_id: z.number(),
+  stop_requested: z.boolean(),
+  status: z.string(),
+});
+
+const createBotSchema = z.object({
+  name: z.string().min(1),
+  symbols: z.array(z.string().min(3)).min(1),
+  timeframe: z.string().min(1),
+  paper_mode: z.literal(true),
+  strategy: z.string().min(1),
+  knobs: knobsSchema,
+});
+
+const updateKnobsSchema = z.object({
+  id: z.number(),
+  knobs: knobsSchema,
+});
+
 async function fetcher<T>(url: string, schema?: z.ZodType<T>): Promise<T> {
   const res = await fetch(url, { credentials: "include" });
-  if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+  if (!res.ok) {
+    const errorText = await res.text().catch(() => "");
+    throw new Error(errorText || `HTTP ${res.status}`);
+  }
+
   const json = await res.json();
   return schema ? schema.parse(json) : json;
 }
 
-async function mutator<T>(url: string, method: string, data?: any, schema?: z.ZodType<T>): Promise<T> {
+async function mutator<T>(
+  url: string,
+  method: "POST" | "PUT" | "PATCH" | "DELETE",
+  data?: unknown,
+  schema?: z.ZodType<T>,
+): Promise<T> {
   const res = await fetch(url, {
     method,
     headers: { "Content-Type": "application/json" },
     body: data ? JSON.stringify(data) : undefined,
     credentials: "include",
   });
+
   if (!res.ok) {
-    const errObj = await res.json().catch(() => ({ message: "Unknown error" }));
-    throw new Error(errObj.message || "Mutation failed");
+    const errorText = await res.text().catch(() => "");
+    throw new Error(errorText || `HTTP ${res.status}`);
   }
+
   const json = await res.json();
   return schema ? schema.parse(json) : json;
 }
 
-// --- QUERIES ---
-
 export function useBots() {
   return useQuery({
-    queryKey: [api.bots.list.path],
-    queryFn: () => fetcher(api.bots.list.path, api.bots.list.responses[200]),
+    queryKey: ["/api/bots"],
+    queryFn: () => fetcher(apiUrl("/api/bots"), z.array(botSchema)),
   });
 }
 
 export function useBot(id: number) {
   return useQuery({
-    queryKey: [api.bots.get.path, id],
-    queryFn: () => fetcher(buildUrl(api.bots.get.path, { id }), api.bots.get.responses[200]),
-    enabled: !!id,
+    queryKey: ["/api/bots", id],
+    queryFn: () => fetcher(apiUrl(`/api/bots/${id}`), botSchema),
+    enabled: Number.isFinite(id) && id > 0,
   });
 }
 
 export function useTrades(status?: string) {
   return useQuery({
-    queryKey: [api.trades.list.path, status],
+    queryKey: ["/api/trades", status ?? "all"],
     queryFn: () => {
-      const url = new URL(api.trades.list.path, window.location.origin);
-      if (status) url.searchParams.append("status", status);
-      return fetcher(url.pathname + url.search, api.trades.list.responses[200]);
+      const url = new URL(apiUrl("/api/trades"), window.location.origin);
+      if (status) {
+        url.searchParams.set("status", status);
+      }
+      return fetcher(url.toString(), z.array(tradeSchema));
     },
   });
 }
 
 export function useGlobalPortfolio() {
   return useQuery({
-    queryKey: [api.portfolio.getGlobal.path],
-    queryFn: () => fetcher(api.portfolio.getGlobal.path, api.portfolio.getGlobal.responses[200]),
+    queryKey: ["/api/portfolio"],
+    queryFn: () => fetcher(apiUrl("/api/portfolio"), portfolioSchema),
   });
 }
 
-export function useMarketTickers() {
+export function useMarketTickers(symbols = "BTC/USDT,ETH/USDT") {
   return useQuery({
-    queryKey: [api.market.tickers.path],
-    queryFn: () => fetcher(api.market.tickers.path, api.market.tickers.responses[200]),
-    refetchInterval: 5000, // Refresh market data frequently
+    queryKey: ["/api/market/tickers", symbols],
+    queryFn: () => fetcher(apiUrl(`/api/market/tickers?symbols=${encodeURIComponent(symbols)}`), z.array(tickerSchema)),
+    refetchInterval: 5000,
   });
 }
 
 export function useJobs() {
   return useQuery({
-    queryKey: [api.jobs.list.path],
-    queryFn: () => fetcher(api.jobs.list.path, api.jobs.list.responses[200]),
+    queryKey: ["/api/jobs"],
+    queryFn: () => fetcher(apiUrl("/api/jobs"), z.array(jobSchema)),
   });
 }
 
-// --- MUTATIONS ---
-
 export function useCreateBot() {
   const queryClient = useQueryClient();
+
   return useMutation({
-    mutationFn: (data: z.infer<typeof api.bots.create.input>) =>
-      mutator(api.bots.create.path, api.bots.create.method, data, api.bots.create.responses[201]),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: [api.bots.list.path] }),
+    mutationFn: (data: z.infer<typeof createBotSchema>) => {
+      const validated = createBotSchema.parse(data);
+      return mutator(apiUrl("/api/bots"), "POST", validated, botSchema);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/bots"] });
+    },
   });
 }
 
 export function useStartBot() {
   const queryClient = useQueryClient();
+
   return useMutation({
-    mutationFn: (id: number) =>
-      mutator(buildUrl(api.bots.start.path, { id }), api.bots.start.method, undefined, api.bots.start.responses[200]),
+    mutationFn: (id: number) => mutator(apiUrl(`/api/bots/${id}/start`), "POST", undefined, startBotResponseSchema),
     onSuccess: (_, id) => {
-      queryClient.invalidateQueries({ queryKey: [api.bots.list.path] });
-      queryClient.invalidateQueries({ queryKey: [api.bots.get.path, id] });
+      queryClient.invalidateQueries({ queryKey: ["/api/bots"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/bots", id] });
+      queryClient.invalidateQueries({ queryKey: ["/api/jobs"] });
     },
   });
 }
 
 export function useStopBot() {
   const queryClient = useQueryClient();
+
   return useMutation({
-    mutationFn: (id: number) =>
-      mutator(buildUrl(api.bots.stop.path, { id }), api.bots.stop.method, undefined, api.bots.stop.responses[200]),
+    mutationFn: (id: number) => mutator(apiUrl(`/api/bots/${id}/stop`), "POST", undefined, stopBotResponseSchema),
     onSuccess: (_, id) => {
-      queryClient.invalidateQueries({ queryKey: [api.bots.list.path] });
-      queryClient.invalidateQueries({ queryKey: [api.bots.get.path, id] });
+      queryClient.invalidateQueries({ queryKey: ["/api/bots"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/bots", id] });
+      queryClient.invalidateQueries({ queryKey: ["/api/jobs"] });
     },
   });
 }
 
 export function useUpdateBotKnobs() {
   const queryClient = useQueryClient();
+
   return useMutation({
-    mutationFn: ({ id, knobs }: { id: number; knobs: any }) =>
-      mutator(
-        buildUrl(api.bots.updateKnobs.path, { id }),
-        api.bots.updateKnobs.method,
-        { knobs },
-        api.bots.updateKnobs.responses[200]
-      ),
+    mutationFn: ({ id, knobs }: z.infer<typeof updateKnobsSchema>) => {
+      const validated = updateKnobsSchema.parse({ id, knobs });
+      return mutator(apiUrl(`/api/bots/${validated.id}/knobs`), "POST", { knobs: validated.knobs }, botSchema);
+    },
     onSuccess: (_, { id }) => {
-      queryClient.invalidateQueries({ queryKey: [api.bots.list.path] });
-      queryClient.invalidateQueries({ queryKey: [api.bots.get.path, id] });
+      queryClient.invalidateQueries({ queryKey: ["/api/bots"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/bots", id] });
     },
   });
 }

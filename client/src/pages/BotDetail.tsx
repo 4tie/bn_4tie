@@ -27,7 +27,12 @@ export default function BotDetail() {
   const handleSave = () => {
     updateKnobs.mutate({ id: botId, knobs }, {
       onSuccess: () => toast({ title: "Configuration Saved", description: "Bot settings updated successfully." }),
-      onError: (err) => toast({ title: "Error", description: err.message, variant: "destructive" })
+      onError: (err) =>
+        toast({
+          title: "Error",
+          description: err instanceof Error ? err.message : "Failed to update bot settings",
+          variant: "destructive",
+        }),
     });
   };
 

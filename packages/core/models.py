@@ -1,66 +1,163 @@
-from sqlalchemy.orm import declarative_base, Mapped, mapped_column
-from sqlalchemy import Integer, String, Float, Boolean, DateTime, JSON, ForeignKey, func
-from datetime import datetime
+from __future__ import annotations
 
-Base = declarative_base()
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    func,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class Base(DeclarativeBase):
+    """Shared SQLAlchemy metadata for API, worker, and Alembic."""
+
 
 class Bot(Base):
-    __tablename__ = 'bots'
-    id: Mapped[int] = mapped_column(primary_key=True, index=True)
-    name: Mapped[str] = mapped_column(String, index=True)
-    symbols: Mapped[list[str]] = mapped_column(JSON)
-    timeframe: Mapped[str] = mapped_column(String)
-    paper_mode: Mapped[bool] = mapped_column(Boolean, default=True)
-    strategy: Mapped[str] = mapped_column(String)
-    knobs: Mapped[dict] = mapped_column(JSON)
-    status: Mapped[str] = mapped_column(String, default="stopped")
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    __tablename__ = "bots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    symbols: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(20), nullable=False)
+    paper_mode: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    strategy: Mapped[str] = mapped_column(String(120), nullable=False)
+    knobs: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict, server_default="{}")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="stopped", server_default="stopped", index=True)
+    stop_requested: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        index=True,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
 
 class Strategy(Base):
-    __tablename__ = 'strategies'
-    id: Mapped[int] = mapped_column(primary_key=True, index=True)
-    name: Mapped[str] = mapped_column(String)
-    description: Mapped[str] = mapped_column(String, nullable=True)
+    __tablename__ = "strategies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False, unique=True, index=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
 
 class Trade(Base):
-    __tablename__ = 'trades'
-    id: Mapped[int] = mapped_column(primary_key=True, index=True)
-    bot_id: Mapped[int] = mapped_column(Integer, ForeignKey('bots.id'))
-    symbol: Mapped[str] = mapped_column(String)
-    side: Mapped[str] = mapped_column(String)
-    amount: Mapped[float] = mapped_column(Float)
-    price: Mapped[float] = mapped_column(Float)
-    status: Mapped[str] = mapped_column(String)
-    pnl: Mapped[float] = mapped_column(Float, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    __tablename__ = "trades"
+    __table_args__ = (
+        Index("ix_trades_bot_status", "bot_id", "status"),
+        Index("ix_trades_bot_created_at", "bot_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bot_id: Mapped[int] = mapped_column(ForeignKey("bots.id", ondelete="CASCADE"), nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    side: Mapped[str] = mapped_column(String(8), nullable=False)
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    price: Mapped[float] = mapped_column(Float, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        index=True,
+    )
+
 
 class Order(Base):
-    __tablename__ = 'orders'
-    id: Mapped[int] = mapped_column(primary_key=True, index=True)
-    trade_id: Mapped[int] = mapped_column(Integer, ForeignKey('trades.id'))
-    exchange_id: Mapped[str] = mapped_column(String, nullable=True)
-    symbol: Mapped[str] = mapped_column(String)
-    side: Mapped[str] = mapped_column(String)
-    type: Mapped[str] = mapped_column(String)
-    amount: Mapped[float] = mapped_column(Float)
-    price: Mapped[float] = mapped_column(Float, nullable=True)
-    status: Mapped[str] = mapped_column(String)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    __tablename__ = "orders"
+    __table_args__ = (
+        Index("ix_orders_trade_status", "trade_id", "status"),
+        Index("ix_orders_symbol_status", "symbol", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    trade_id: Mapped[int] = mapped_column(ForeignKey("trades.id", ondelete="CASCADE"), nullable=False, index=True)
+    exchange_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    side: Mapped[str] = mapped_column(String(8), nullable=False)
+    type: Mapped[str] = mapped_column(String(32), nullable=False)
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
 
 class PortfolioSnapshot(Base):
-    __tablename__ = 'portfolio_snapshots'
-    id: Mapped[int] = mapped_column(primary_key=True, index=True)
-    bot_id: Mapped[int] = mapped_column(Integer, ForeignKey('bots.id'), nullable=True)
-    equity: Mapped[float] = mapped_column(Float)
-    cash: Mapped[float] = mapped_column(Float)
-    positions_value: Mapped[float] = mapped_column(Float)
-    timestamp: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    __tablename__ = "portfolio_snapshots"
+    __table_args__ = (Index("ix_portfolio_snapshots_bot_timestamp", "bot_id", "timestamp"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bot_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bots.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    equity: Mapped[float] = mapped_column(Float, nullable=False)
+    cash: Mapped[float] = mapped_column(Float, nullable=False)
+    positions_value: Mapped[float] = mapped_column(Float, nullable=False)
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        index=True,
+    )
+
 
 class Job(Base):
-    __tablename__ = 'jobs'
-    id: Mapped[int] = mapped_column(primary_key=True, index=True)
-    bot_id: Mapped[int] = mapped_column(Integer, ForeignKey('bots.id'))
-    task: Mapped[str] = mapped_column(String)
-    status: Mapped[str] = mapped_column(String)
-    progress: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    __tablename__ = "jobs"
+    __table_args__ = (Index("ix_jobs_bot_status", "bot_id", "status"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bot_id: Mapped[int | None] = mapped_column(
+        ForeignKey("bots.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    task: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    celery_task_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        index=True,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
