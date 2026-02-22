@@ -1,0 +1,156 @@
+You are Replit AI. Create a production-grade monorepo for a LOCAL-FIRST Binance paper-trading bot platform (no Docker anywhere). The project must run on a developer machine using local services installed on the OS (Postgres, Redis, Ollama). No mock UI, no placeholder text, no fake data. All UI states must be real: loading/empty/error states.
+
+REPO NAME:
+binance-bot-platform
+
+GOALS (Phase 1 foundation only, but architecture must be future-proof):
+- Backend: FastAPI + Pydantic v2 + SQLAlchemy 2.0 + Alembic
+- Jobs/Workers: Celery + Redis broker (local redis)
+- DB: Postgres (local postgres, connection via DATABASE_URL)
+- Realtime: Server-Sent Events (SSE) endpoint /sse for bots/trades/jobs/portfolio updates
+- Exchange: CCXT (Binance public endpoints for market data; paper trading only in Phase 1)
+- AI: Ollama integration (free local models only) - in Phase 1 only implement /ai/models listing and a health check, do not implement trading automation yet.
+- Frontends:
+  1) Web: Next.js (TypeScript) with a clean dark theme (NO BLUE COLORS at all). Accent palette: purple/magenta, plus green/red/orange for status. Layout must match the “clean trading dashboard” style: sidebar, top status bar, cards, tables.
+  2) Mobile: Expo React Native (TypeScript) layout must match the “mobile overlay” style: stacked cards, simple list views, quick actions. It is NOT the same layout as web, but same branding and tokens.
+
+CONSTRAINTS:
+- NEVER use Docker, docker-compose, containers, or any container scripts.
+- No auth.
+- Paper trading only.
+- Spot market only.
+- No placeholder pages or filler content.
+- Strong typing, clean architecture, minimal but real UI.
+
+MONOREPO STRUCTURE:
+repo/
+  apps/
+    api/          # FastAPI backend
+    worker/       # Celery worker package
+    web/          # Next.js web app
+    mobile/       # Expo app
+  packages/
+    core/         # shared domain types/schemas/enums
+    ui/           # shared UI tokens (colors/typography/spacing) used by web + a mirrored config for mobile
+  storage/
+    artifacts/    # local artifacts (backtests later); ensure dirs are created on startup
+  docs/
+    SPEC.md       # write an accurate spec (DB schema + API + SSE events)
+    RUN_LOCAL.md  # exact steps to run locally without Docker
+
+BACKEND REQUIREMENTS (apps/api):
+1) Provide env-based config:
+   - DATABASE_URL (postgres)
+   - REDIS_URL
+   - OLLAMA_BASE_URL (default http://localhost:11434)
+   - ARTIFACTS_DIR (default ./storage/artifacts)
+   - BINANCE_RATE_LIMIT_MS default 200
+2) Alembic migrations for tables:
+   - bots
+   - strategies
+   - trades
+   - orders
+   - portfolio_snapshots
+   - jobs
+3) Core endpoints:
+   - GET /health (checks DB connectivity, Redis connectivity, and filesystem artifacts dir)
+   - GET /sse (SSE stream; supports optional query params bot_id and job_id to filter events)
+   - Bots:
+     - GET /bots
+     - POST /bots (create bot with name, symbols array, timeframe, paper_mode=true, strategy reference, knobs)
+     - GET /bots/{id}
+     - POST /bots/{id}/start (enqueue a Celery task loop)
+     - POST /bots/{id}/stop (signal stop via DB status + redis pubsub or a stop flag)
+     - POST /bots/{id}/knobs (validate and update knobs)
+   - Trades/Orders (Phase 1 minimal):
+     - GET /trades?status=open|closed
+     - GET /orders
+   - Portfolio:
+     - GET /portfolio (global latest snapshot)
+     - GET /portfolio/{bot_id} (latest bot snapshot)
+   - Market:
+     - GET /market/tickers?symbols=BTC/USDT,ETH/USDT
+     - GET /market/ohlcv?symbol=BTC/USDT&timeframe=1h&limit=500
+   - Jobs:
+     - GET /jobs
+     - GET /jobs/{id}
+   - AI:
+     - GET /ai/models (call Ollama tags/list endpoint and return models)
+     - GET /ai/health (ping ollama)
+4) SSE event contract (must be implemented and documented in docs/SPEC.md):
+   - event: bot.state (bot_id, status, ts)
+   - event: portfolio.snapshot (bot_id nullable, equity, cash, positions_value, ts)
+   - event: job.progress (job_id, progress, status, ts)
+   - event: system.notice (level, message, ts)
+SSE must be real: when bot runs and snapshots are written, events must be emitted.
+
+WORKER REQUIREMENTS (apps/worker):
+- Celery worker with tasks:
+  - bot_run_loop(bot_id): every N seconds:
+     - fetch tickers via ccxt for bot symbols
+     - update a simulated paper portfolio snapshot (very simple: keep cash constant in Phase 1, positions empty) OR optionally compute equity from balances if you implement a paper wallet model
+     - write portfolio_snapshots row
+     - emit SSE event through a shared event bus mechanism (e.g., Redis pubsub channel 'events' that API listens to)
+     - update jobs progress periodically
+  - bot_stop(bot_id): marks bot stopped
+- Ensure tasks are idempotent and respect bot status flag.
+
+EVENT BUS:
+- Use Redis pubsub as the event bus:
+  - Worker publishes JSON events to channel 'events'
+  - API subscribes and fans out to SSE clients
+
+SHARED DOMAIN (packages/core):
+- Define Pydantic models for:
+  - Bot, Trade, Order, PortfolioSnapshot, Job
+  - Enums for statuses
+- Define Knobs schema:
+  - max_open_trades
+  - stake_amount
+  - stop_loss_pct
+  - take_profit_pct
+  - cooldown_minutes
+Provide strict validation and default values.
+
+WEB APP (apps/web):
+- Next.js app router (TypeScript)
+- Dark theme tokens from packages/ui (NO BLUE)
+- Layout similar to clean trading dashboard:
+  - Left sidebar
+  - Top bar with bot status + paper badge
+  - Dashboard page:
+     - cards for portfolio value, daily pnl (can be derived as 0 in Phase 1), win rate (0), open trades count
+     - market overview table (tickers)
+     - bots list with toggle buttons calling /start and /stop
+     - recent trades table (empty state real)
+  - Jobs page showing job list and status
+- SSE client: connect to /sse and update UI live.
+
+MOBILE APP (apps/mobile):
+- Expo TypeScript
+- Uses same backend endpoints
+- Layout similar to mobile overlay:
+  - Dashboard screen with stacked cards
+  - Bots status list
+  - Portfolio summary
+  - Quick actions: Start/Stop bot
+- SSE client using EventSource polyfill or fallback polling if needed; document approach.
+
+LOCAL RUN (docs/RUN_LOCAL.md):
+- Provide exact commands:
+  - python -m venv
+  - pip install -r requirements
+  - alembic upgrade head
+  - start api (uvicorn)
+  - start worker (celery -A ...)
+  - start web (npm)
+  - start mobile (npx expo)
+- Provide steps to install/verify local Postgres and Redis (no Docker).
+- Provide example .env template with DATABASE_URL, REDIS_URL, OLLAMA_BASE_URL.
+
+QUALITY:
+- Use consistent error format JSON: { "detail": "...", "code": "...", "meta": {...} }
+- No placeholder content in UI. Use real empty/loading/error states.
+- Add minimal unit tests for knobs validation and one API smoke test.
+
+Finally, output the full file tree and all code. Ensure imports work and project can run locally without Docker.
