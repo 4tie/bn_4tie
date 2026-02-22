@@ -1,5 +1,5 @@
 [project]
-name = "repl-nix-workspace"
+name = "bn-4tie"
 version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.11"
@@ -16,4 +16,19 @@ dependencies = [
     "sqlalchemy>=2.0.46",
     "sse-starlette>=3.2.0",
     "uvicorn>=0.41.0",
+]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["apps*", "packages*"]
+exclude = [
+    "client*",
+    "storage*",
+    "attached_assets*",
+    "docs*",
+    ".local*",
+    ".qodo*",
 ]
