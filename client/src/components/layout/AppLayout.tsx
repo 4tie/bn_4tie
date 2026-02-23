@@ -1,6 +1,6 @@
 import { ReactNode } from "react";
 import { Link, useLocation } from "wouter";
-import { Activity, LayoutDashboard, Settings, ListTree, Zap, ShieldAlert } from "lucide-react";
+import { Activity, LayoutDashboard, ListTree, Zap, ShieldAlert } from "lucide-react";
 import { useRealtimeUpdates } from "@/hooks/use-sse";
 import { Badge } from "@/components/ui/badge";
 
@@ -11,6 +11,7 @@ export function AppLayout({ children }: { children: ReactNode }) {
 
   const navItems = [
     { href: "/", label: "Dashboard", icon: LayoutDashboard },
+    { href: "/trades", label: "Trades", icon: ListTree },
     { href: "/jobs", label: "Jobs Monitor", icon: Activity },
   ];
 

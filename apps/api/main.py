@@ -3,10 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncGenerator
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
@@ -15,7 +15,7 @@ import redis.asyncio as redis
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
-from sqlalchemy import desc, select, text
+from sqlalchemy import asc, desc, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.database import get_db
@@ -31,13 +31,16 @@ from packages.core.schemas import (
     MarketOhlcvResponse,
     MarketTicker,
     OllamaModel,
+    OrderCreate,
+    OrderExecutionResponse,
     OrderRead,
     PortfolioSnapshotRead,
+    TradeCloseResponse,
     TradeRead,
 )
 from packages.core.settings import Settings, get_settings
 
-app = FastAPI(title="Local-First Binance Bot API", version="1.0.0")
+app = FastAPI(title="Local-First Binance Bot API", version="2.0.0")
 router = APIRouter()
 
 app.add_middleware(
@@ -52,6 +55,10 @@ app.add_middleware(
 @lru_cache(maxsize=1)
 def _settings() -> Settings:
     return get_settings()
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _serialize_json(value: Any) -> str:
@@ -131,6 +138,13 @@ def _fetch_binance_ohlcv(symbol: str, timeframe: str, limit: int) -> list[list[f
             close_method()
 
 
+def _fetch_last_price(symbol: str) -> float:
+    rows = _fetch_binance_tickers([symbol])
+    if not rows:
+        raise RuntimeError(f"No ticker found for {symbol}")
+    return float(rows[0]["price"])
+
+
 def _ollama_get(path: str) -> tuple[int, dict[str, Any]]:
     base = _settings().ollama_base_url.rstrip("/")
     req = urlrequest.Request(f"{base}{path}", headers={"Accept": "application/json"})
@@ -138,6 +152,15 @@ def _ollama_get(path: str) -> tuple[int, dict[str, Any]]:
         body = response.read().decode("utf-8")
         parsed: dict[str, Any] = json.loads(body) if body else {}
         return response.status, parsed
+
+
+async def _publish_runtime_event(event_name: str, payload: dict[str, Any]) -> None:
+    client = redis.from_url(_settings().redis_url, decode_responses=True)
+    try:
+        event = {"event": event_name, "data": payload}
+        await client.publish("events", json.dumps(event, default=_json_default))
+    finally:
+        await client.aclose()
 
 
 async def _redis_sse_stream(
@@ -194,6 +217,125 @@ async def _redis_sse_stream(
         await pubsub.unsubscribe("events")
         await pubsub.close()
         await client.aclose()
+
+
+async def _resolve_strategy_for_bot_create(db: AsyncSession, requested_strategy: str | None) -> Strategy:
+    if requested_strategy:
+        normalized_name = requested_strategy.strip()
+        strategy_query = (
+            select(Strategy)
+            .where(Strategy.name == normalized_name)
+            .order_by(desc(Strategy.version))
+            .limit(1)
+        )
+        existing = (await db.execute(strategy_query)).scalars().first()
+        if existing:
+            return existing
+
+        strategy = Strategy(name=normalized_name, version=1, description=None)
+        db.add(strategy)
+        await db.flush()
+        return strategy
+
+    baseline_query = select(Strategy).where(Strategy.name == "baseline", Strategy.version == 1).limit(1)
+    baseline = (await db.execute(baseline_query)).scalars().first()
+    if baseline:
+        return baseline
+
+    baseline = Strategy(name="baseline", version=1, description="Phase 1 default strategy")
+    db.add(baseline)
+    await db.flush()
+    return baseline
+
+
+def _resolve_fee_rate(bot: Bot | None) -> float:
+    default_fee = float(_settings().paper_fee_rate)
+    if not bot or not isinstance(bot.knobs, dict):
+        return default_fee
+
+    raw = bot.knobs.get("fee_rate")
+    try:
+        fee_rate = float(raw)
+    except (TypeError, ValueError):
+        return default_fee
+
+    if fee_rate < 0:
+        return default_fee
+    return fee_rate
+
+
+def _validate_order_amounts(payload: OrderCreate) -> None:
+    fields_count = int(payload.quote_amount is not None) + int(payload.base_qty is not None)
+    if payload.side == "buy" and fields_count != 1:
+        raise HTTPException(
+            status_code=422,
+            detail="Buy market orders require exactly one of quote_amount or base_qty",
+        )
+
+    if payload.side == "sell" and fields_count > 1:
+        raise HTTPException(
+            status_code=422,
+            detail="Sell market orders allow at most one of quote_amount or base_qty",
+        )
+
+
+async def _close_trade_by_market(
+    db: AsyncSession,
+    trade: Trade,
+    fee_rate: float,
+    symbol: str,
+    paper_mode: bool,
+) -> tuple[Trade, Order]:
+    if trade.status != "open":
+        raise HTTPException(status_code=409, detail="Trade is not open")
+
+    mark_price = await asyncio.to_thread(_fetch_last_price, symbol)
+    proceeds = float(trade.amount * mark_price)
+    sell_fee = float(proceeds * fee_rate)
+
+    fees_total = float((trade.fees_paid_quote or 0.0) + sell_fee)
+    realized = float(proceeds - (trade.cost_basis_quote or 0.0) - fees_total)
+
+    trade.price = mark_price
+    trade.fees_paid_quote = fees_total
+    trade.realized_pnl_quote = realized
+    trade.unrealized_pnl_quote = None
+    trade.pnl = realized
+    trade.status = "closed"
+    trade.closed_at = _utc_now()
+
+    order = Order(
+        bot_id=trade.bot_id,
+        trade_id=trade.id,
+        symbol=trade.symbol,
+        side="sell",
+        type="market",
+        amount=float(trade.amount),
+        quote_amount=proceeds,
+        base_qty=float(trade.amount),
+        price=mark_price,
+        fee_quote=sell_fee,
+        paper_mode=paper_mode,
+        status="filled",
+    )
+    db.add(order)
+    await db.flush()
+
+    await _publish_runtime_event(
+        "trade.closed",
+        {
+            "bot_id": trade.bot_id,
+            "trade_id": trade.id,
+            "order_id": order.id,
+            "symbol": trade.symbol,
+            "price": mark_price,
+            "realized_pnl_quote": realized,
+            "fees_paid_quote": fees_total,
+            "ts": _utc_now().isoformat(),
+        },
+    )
+
+    return trade, order
 
 
 @app.on_event("startup")
@@ -303,35 +445,6 @@ async def ai_health() -> dict[str, Any]:
             "base_url": _settings().ollama_base_url,
             "error": str(exc),
         }
-
-
-async def _resolve_strategy_for_bot_create(db: AsyncSession, requested_strategy: str | None) -> Strategy:
-    if requested_strategy:
-        normalized_name = requested_strategy.strip()
-        strategy_query = (
-            select(Strategy)
-            .where(Strategy.name == normalized_name)
-            .order_by(desc(Strategy.version))
-            .limit(1)
-        )
-        existing = (await db.execute(strategy_query)).scalars().first()
-        if existing:
-            return existing
-
-        strategy = Strategy(name=normalized_name, version=1, description=None)
-        db.add(strategy)
-        await db.flush()
-        return strategy
-
-    baseline_query = select(Strategy).where(Strategy.name == "baseline", Strategy.version == 1).limit(1)
-    baseline = (await db.execute(baseline_query)).scalars().first()
-    if baseline:
-        return baseline
-
-    baseline = Strategy(name="baseline", version=1, description="Phase 1 default strategy")
-    db.add(baseline)
-    await db.flush()
-    return baseline
 
 
 @router.post("/bots", response_model=BotRead, status_code=201)
@@ -475,19 +588,149 @@ async def get_job(job_id: int, db: AsyncSession = Depends(get_db)) -> JobRead:
 
 
 @router.get("/trades", response_model=list[TradeRead])
-async def list_trades(status: str | None = Query(default=None), db: AsyncSession = Depends(get_db)) -> list[TradeRead]:
+async def list_trades(
+    status: Literal["open", "closed"] | None = Query(default=None),
+    bot_id: int | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> list[TradeRead]:
     query = select(Trade).order_by(desc(Trade.created_at))
     if status:
         query = query.where(Trade.status == status)
+    if bot_id is not None:
+        query = query.where(Trade.bot_id == bot_id)
 
     result = await db.execute(query)
     return [TradeRead.model_validate(trade) for trade in result.scalars().all()]
+
+
+@router.post("/trades/{trade_id}/close", response_model=TradeCloseResponse)
+async def close_trade(trade_id: int, db: AsyncSession = Depends(get_db)) -> TradeCloseResponse:
+    trade = await db.get(Trade, trade_id)
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    bot: Bot | None = await db.get(Bot, trade.bot_id) if trade.bot_id is not None else None
+    if bot is not None and not bot.paper_mode:
+        raise HTTPException(status_code=400, detail="Only paper trades can be closed in Phase 2")
+
+    fee_rate = _resolve_fee_rate(bot)
+    trade, order = await _close_trade_by_market(
+        db=db,
+        trade=trade,
+        fee_rate=fee_rate,
+        symbol=trade.symbol,
+        paper_mode=bot.paper_mode if bot else True,
+    )
+
+    await db.commit()
+    await db.refresh(trade)
+    await db.refresh(order)
+    return TradeCloseResponse(trade=TradeRead.model_validate(trade), order=OrderRead.model_validate(order))
 
 
 @router.get("/orders", response_model=list[OrderRead])
 async def list_orders(db: AsyncSession = Depends(get_db)) -> list[OrderRead]:
     result = await db.execute(select(Order).order_by(desc(Order.created_at)))
     return [OrderRead.model_validate(order) for order in result.scalars().all()]
+
+
+@router.post("/orders", response_model=OrderExecutionResponse, status_code=201)
+async def create_order(payload: OrderCreate, db: AsyncSession = Depends(get_db)) -> OrderExecutionResponse:
+    _validate_order_amounts(payload)
+
+    bot: Bot | None = None
+    if payload.bot_id is not None:
+        bot = await db.get(Bot, payload.bot_id)
+        if not bot:
+            raise HTTPException(status_code=404, detail="Bot not found")
+
+    paper_mode = bot.paper_mode if bot is not None else (payload.paper_mode if payload.paper_mode is not None else True)
+    if not paper_mode:
+        raise HTTPException(status_code=400, detail="Only paper_mode=true is supported in Phase 2")
+
+    fee_rate = _resolve_fee_rate(bot)
+
+    if payload.side == "buy":
+        price = await asyncio.to_thread(_fetch_last_price, payload.symbol)
+        quote_amount = float(payload.quote_amount if payload.quote_amount is not None else payload.base_qty * price)
+        base_qty = float(payload.base_qty if payload.base_qty is not None else quote_amount / price)
+        fee_quote = float(fee_rate * quote_amount)
+
+        trade = Trade(
+            bot_id=payload.bot_id,
+            symbol=payload.symbol,
+            side="buy",
+            amount=base_qty,
+            price=price,
+            cost_basis_quote=quote_amount,
+            fees_paid_quote=fee_quote,
+            unrealized_pnl_quote=None,
+            realized_pnl_quote=None,
+            status="open",
+            pnl=None,
+        )
+        db.add(trade)
+        await db.flush()
+
+        order = Order(
+            bot_id=payload.bot_id,
+            trade_id=trade.id,
+            symbol=payload.symbol,
+            side="buy",
+            type="market",
+            amount=base_qty,
+            quote_amount=quote_amount,
+            base_qty=base_qty,
+            price=price,
+            fee_quote=fee_quote,
+            paper_mode=True,
+            status="filled",
+        )
+        db.add(order)
+        await db.commit()
+        await db.refresh(order)
+
+        await _publish_runtime_event(
+            "trade.opened",
+            {
+                "bot_id": payload.bot_id,
+                "trade_id": trade.id,
+                "order_id": order.id,
+                "symbol": payload.symbol,
+                "qty": base_qty,
+                "price": price,
+                "cost_basis_quote": quote_amount,
+                "fee_quote": fee_quote,
+                "ts": _utc_now().isoformat(),
+            },
+        )
+
+        return OrderExecutionResponse(order=OrderRead.model_validate(order), trade_id=trade.id)
+
+    # side == sell
+    trade_query = select(Trade).where(Trade.status == "open", Trade.symbol == payload.symbol)
+    if payload.bot_id is not None:
+        trade_query = trade_query.where(Trade.bot_id == payload.bot_id)
+    trade_query = trade_query.order_by(asc(Trade.created_at)).limit(1)
+    trade = (await db.execute(trade_query)).scalars().first()
+    if not trade:
+        raise HTTPException(status_code=404, detail="No open trade found to close for this symbol")
+
+    if payload.base_qty is not None and abs(payload.base_qty - float(trade.amount)) > 1e-12:
+        raise HTTPException(status_code=400, detail="Partial closes are not supported in Phase 2")
+
+    trade, order = await _close_trade_by_market(
+        db=db,
+        trade=trade,
+        fee_rate=fee_rate,
+        symbol=payload.symbol,
+        paper_mode=True,
+    )
+
+    await db.commit()
+    await db.refresh(order)
+
+    return OrderExecutionResponse(order=OrderRead.model_validate(order), trade_id=trade.id)
 
 
 app.include_router(router)

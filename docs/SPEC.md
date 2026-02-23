@@ -1,171 +1,145 @@
-# Phase 1 Spec (Local-First Python)
+# Phase 2 Spec (Local-First Python)
 
 ## Architecture
 - API: FastAPI (`apps/api`)
 - Worker: Celery (`apps/worker`)
-- Broker/Event Bus: Redis (`events` pubsub channel)
+- Broker + event bus: Redis pubsub channel `events`
 - Database: PostgreSQL via `DATABASE_URL`
-- Market Data: `ccxt` (Binance public endpoints)
-- AI Model Provider: Ollama local API (`OLLAMA_BASE_URL`, default `http://localhost:11434`)
-- Artifacts directory: `storage/artifacts` (auto-created on API startup)
+- Market data: `ccxt` Binance public endpoints
+- AI models: Ollama (`OLLAMA_BASE_URL`, default `http://localhost:11434`)
+- Artifacts: `storage/artifacts` auto-created on API startup
+
+All API endpoints are available at both root path and `/api` prefix.
 
 ## Database Schema
 
 ### `bots`
-- `id` PK
-- `name` text indexed
-- `symbols` JSON list of trading symbols
-- `timeframe` text
-- `paper_mode` bool (Phase 1 requires `true`)
-- `strategy` text
-- `knobs` JSON object
-- `status` text indexed (`stopped|running|...`)
-- `stop_requested` bool indexed
-- `created_at` timestamptz indexed
-- `updated_at` timestamptz
+- `id`, `name`, `symbols`, `timeframe`, `paper_mode`, `strategy`, `knobs`
+- `status`, `stop_requested`, `created_at`, `updated_at`
 
 ### `strategies`
-- `id` PK
-- `name` unique indexed
-- `description` text nullable
-- `created_at` timestamptz
+- `id`, `name`, `version`, `description`, `created_at`
+- Unique index: `(name, version)`
 
 ### `trades`
-- `id` PK
-- `bot_id` FK -> `bots.id`
-- `symbol` indexed
-- `side`, `amount`, `price`, `status` indexed
-- `pnl` nullable
-- `created_at` timestamptz indexed
-- Composite indexes:
-- `ix_trades_bot_status` (`bot_id`, `status`)
-- `ix_trades_bot_created_at` (`bot_id`, `created_at`)
+- `id`, `bot_id` (nullable FK), `symbol`, `side`, `amount`, `price`, `status`
+- `cost_basis_quote`, `fees_paid_quote`
+- `unrealized_pnl_quote`, `realized_pnl_quote`, `pnl`, `closed_at`
+- `created_at`
+- Indexes:
+- `(bot_id, status)`
+- `(bot_id, created_at)`
 
 ### `orders`
-- `id` PK
-- `trade_id` FK -> `trades.id`
-- `exchange_id` indexed nullable
-- `symbol` indexed
-- `side`, `type`, `amount`, `price`, `status` indexed
-- `created_at` timestamptz
-- Composite indexes:
-- `ix_orders_trade_status` (`trade_id`, `status`)
-- `ix_orders_symbol_status` (`symbol`, `status`)
+- `id`, `bot_id` (nullable FK), `trade_id` (nullable FK)
+- `exchange_id`, `symbol`, `side`, `type`, `amount`
+- `quote_amount`, `base_qty`, `price`, `fee_quote`, `paper_mode`, `status`
+- `created_at`
+- Indexes:
+- `(trade_id, status)`
+- `(symbol, status)`
+- `bot_id`
 
 ### `portfolio_snapshots`
-- `id` PK
-- `bot_id` FK -> `bots.id` nullable
-- `equity`, `cash`, `positions_value`
-- `timestamp` timestamptz indexed
-- Composite index:
-- `ix_portfolio_snapshots_bot_timestamp` (`bot_id`, `timestamp`)
+- `id`, `bot_id` (nullable FK), `equity`, `cash`, `positions_value`, `timestamp`
+- Index: `(bot_id, timestamp)`
 
 ### `jobs`
-- `id` PK
-- `bot_id` FK -> `bots.id` nullable
-- `task`, `status` indexed
-- `progress` int 0-100
-- `message` nullable
-- `celery_task_id` indexed nullable
-- `created_at` timestamptz indexed
-- `updated_at` timestamptz
-- Composite index:
-- `ix_jobs_bot_status` (`bot_id`, `status`)
+- `id`, `bot_id` (nullable FK), `task`, `status`, `progress`, `message`, `celery_task_id`
+- `created_at`, `updated_at`
+- Index: `(bot_id, status)`
 
-## API Endpoints
-All endpoints are served at both root and `/api` prefixes.
+## Core API Endpoints
 
 ### Health + SSE
 - `GET /health`
-- Checks DB connectivity, Redis connectivity, and artifacts dir existence.
-
-- `GET /sse?bot_id=<int>&job_id=<int>`
-- Real SSE stream from Redis pubsub channel `events`.
-- Optional filtering by `bot_id` and/or `job_id`.
+  - Checks DB connectivity, Redis connectivity, artifacts path.
+- `GET /sse?bot_id=<id>&job_id=<id>`
+  - Streams from Redis channel `events`.
+  - Supports optional `bot_id` / `job_id` filters.
 
 ### Market
 - `GET /market/tickers?symbols=BTC/USDT,ETH/USDT`
-- Uses `ccxt.binance()` and returns real ticker values.
-- Response item:
-  - `symbol`
-  - `price`
-  - `change_24h` (nullable)
-  - `timestamp` (nullable)
-
+  - Real ticker data from `ccxt.binance()`.
 - `GET /market/ohlcv?symbol=BTC/USDT&timeframe=1h&limit=500`
-- Uses `ccxt.binance().fetch_ohlcv`.
-- Returns OHLCV array.
+  - Real OHLCV from Binance via ccxt.
 
 ### AI
 - `GET /ai/models`
-- Calls Ollama `/api/tags` and returns discovered models.
-
+  - Calls Ollama `GET /api/tags`, no hardcoded list.
 - `GET /ai/health`
-- Pings Ollama and returns status.
+  - Ollama reachability check.
 
 ### Bots
 - `POST /bots`
-- Create bot with:
-  - `name`
-  - `symbols[]`
-  - `timeframe`
-  - `paper_mode` (must be `true`)
-  - `strategy`
-  - `knobs` (validated schema)
-
+  - `strategy` is optional.
+  - If omitted, API resolves/creates default `baseline` v1 strategy.
 - `GET /bots`
 - `GET /bots/{id}`
-
 - `POST /bots/{id}/start`
-- Sets bot running, creates a `jobs` row, enqueues Celery `bot_run_loop(bot_id)`.
-
 - `POST /bots/{id}/stop`
-- Sets bot stopped, sets stop flag, enqueues Celery `bot_stop(bot_id)`.
-
 - `POST /bots/{id}/knobs`
-- Validates and persists knobs JSON.
 
-### Portfolio
+### Orders (Phase 2)
+- `POST /orders` (paper market only)
+  - Request:
+    - `bot_id` optional
+    - `symbol`
+    - `side` = `buy|sell`
+    - `type` = `market`
+    - `quote_amount` or `base_qty` (buy requires exactly one)
+  - Response:
+    - `order`
+    - `trade_id` (if created/linked)
+
+### Trades (Phase 2)
+- `GET /trades?status=open|closed&bot_id=<id>`
+- `POST /trades/{id}/close`
+  - Closes open paper trade at live market price.
+
+### Portfolio + Jobs
 - `GET /portfolio`
-- Latest snapshot globally.
-
 - `GET /portfolio/{bot_id}`
-- Latest snapshot for a bot.
-
-### Jobs
 - `GET /jobs`
 - `GET /jobs/{id}`
 
-### Additional reads used by web
-- `GET /trades`
-- `GET /orders`
+## Paper Execution Rules
 
-## Worker Behavior
+### Buy market
+- Fetch live price from Binance ticker.
+- If `quote_amount` provided: `qty = quote_amount / price`.
+- Fee: `fee_rate * quote_amount` where `fee_rate` comes from:
+  - bot `knobs.fee_rate` if valid, else `PAPER_FEE_RATE` default.
+- Create open `trade` + filled `order`.
+- Emit `trade.opened`.
 
-### `bot_run_loop(bot_id)`
-- Runs every `BOT_LOOP_INTERVAL_SECONDS`.
-- Stops when bot is not `running` or stop flag is set.
-- Per iteration:
-  - Fetches live ticker data for bot symbols using `ccxt` (Binance public)
-  - Persists one `portfolio_snapshots` row
-  - Publishes `portfolio.snapshot` event to Redis `events`
-  - Publishes periodic `job.progress`
-- Publishes `bot.state` when entering running and stopping.
+### Sell market / close
+- Close open trade by live market price.
+- Proceeds: `qty * price`.
+- Fee: `fee_rate * proceeds`.
+- Realized PnL: `proceeds - cost_basis_quote - total_fees`.
+- Update trade to `closed`, create filled sell order.
+- Emit `trade.closed`.
 
-### `bot_stop(bot_id)`
-- Sets stop flag and bot status.
-- Publishes `bot.state` and terminal `job.progress`.
+### Worker mark-to-market
+On each bot loop tick:
+- Fetch latest prices for configured symbols.
+- Update `unrealized_pnl_quote` for open trades.
+- Emit `trade.updated` for each updated trade.
+- Persist `portfolio_snapshots`.
+- Emit `portfolio.snapshot`.
+- Emit periodic `job.progress` and `bot.state` transitions.
 
-## SSE Event Payloads
-All events are published to Redis channel `events` and forwarded by `/sse`.
+## SSE Events
+All emitted on Redis channel `events` and forwarded by `/sse`.
 
 ### `bot.state`
 ```json
 {
   "bot_id": 1,
   "status": "running",
-  "job_id": 12,
-  "ts": "2026-02-23T00:00:00+00:00"
+  "job_id": 10,
+  "ts": "2026-02-23T04:00:00+00:00"
 }
 ```
 
@@ -173,14 +147,10 @@ All events are published to Redis channel `events` and forwarded by `/sse`.
 ```json
 {
   "bot_id": 1,
-  "equity": 10000.0,
-  "cash": 10000.0,
-  "positions_value": 0.0,
-  "ts": "2026-02-23T00:00:05+00:00",
-  "prices": {
-    "BTC/USDT": 97000.0,
-    "ETH/USDT": 5300.0
-  }
+  "equity": 9999.4,
+  "cash": 9899.4,
+  "positions_value": 100.0,
+  "ts": "2026-02-23T04:00:05+00:00"
 }
 ```
 
@@ -188,19 +158,58 @@ All events are published to Redis channel `events` and forwarded by `/sse`.
 ```json
 {
   "bot_id": 1,
-  "job_id": 12,
+  "job_id": 10,
   "status": "running",
-  "progress": 27,
-  "ts": "2026-02-23T00:00:10+00:00"
+  "progress": 15,
+  "ts": "2026-02-23T04:00:05+00:00"
+}
+```
+
+### `trade.opened`
+```json
+{
+  "bot_id": 1,
+  "trade_id": 21,
+  "order_id": 35,
+  "symbol": "BTC/USDT",
+  "qty": 0.001,
+  "price": 100000.0,
+  "cost_basis_quote": 100.0,
+  "fee_quote": 0.1,
+  "ts": "2026-02-23T04:01:00+00:00"
+}
+```
+
+### `trade.updated`
+```json
+{
+  "bot_id": 1,
+  "trade_id": 21,
+  "symbol": "BTC/USDT",
+  "price": 100120.0,
+  "unrealized_pnl_quote": 0.02,
+  "ts": "2026-02-23T04:01:05+00:00"
+}
+```
+
+### `trade.closed`
+```json
+{
+  "bot_id": 1,
+  "trade_id": 21,
+  "order_id": 36,
+  "symbol": "BTC/USDT",
+  "price": 100200.0,
+  "realized_pnl_quote": 0.1,
+  "fees_paid_quote": 0.2,
+  "ts": "2026-02-23T04:01:10+00:00"
 }
 ```
 
 ### `system.notice`
 ```json
 {
-  "bot_id": 1,
-  "job_id": 12,
   "message": "Ticker fetch error: ...",
-  "ts": "2026-02-23T00:00:15+00:00"
+  "ts": "2026-02-23T04:01:15+00:00"
 }
 ```

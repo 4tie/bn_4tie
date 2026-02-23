@@ -21,7 +21,7 @@ const formSchema = z.object({
   name: z.string().min(1, "Name is required"),
   symbols: z.string().min(1, "At least one symbol is required"),
   timeframe: z.string().min(1, "Timeframe required (e.g. 1h)"),
-  strategy: z.string().min(1, "Strategy required"),
+  strategy: z.string().optional(),
 });
 
 type FormValues = z.infer<typeof formSchema>;
@@ -37,7 +37,7 @@ export function CreateBotDialog() {
       name: "",
       symbols: "BTC/USDT,ETH/USDT",
       timeframe: "1h",
-      strategy: "RSI_MACD",
+      strategy: "",
     },
   });
 
@@ -115,8 +115,13 @@ export function CreateBotDialog() {
               <Input id="timeframe" placeholder="1h, 4h, 1d" className="bg-background" {...form.register("timeframe")} />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="strategy">Strategy</Label>
-              <Input id="strategy" placeholder="RSI_MACD" className="bg-background" {...form.register("strategy")} />
+              <Label htmlFor="strategy">Strategy (optional)</Label>
+              <Input
+                id="strategy"
+                placeholder="Leave blank for baseline"
+                className="bg-background"
+                {...form.register("strategy")}
+              />
             </div>
           </div>
           <DialogFooter className="pt-4">

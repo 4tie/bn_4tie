@@ -38,9 +38,18 @@ export function useRealtimeUpdates() {
       queryClient.invalidateQueries({ queryKey: ["/api/jobs"] });
     };
 
+    const handleTradeEvent = () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/trades"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/orders"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/portfolio"] });
+    };
+
     eventSource.addEventListener("bot.state", handleBotState);
     eventSource.addEventListener("portfolio.snapshot", handlePortfolio);
     eventSource.addEventListener("job.progress", handleJobProgress);
+    eventSource.addEventListener("trade.opened", handleTradeEvent);
+    eventSource.addEventListener("trade.updated", handleTradeEvent);
+    eventSource.addEventListener("trade.closed", handleTradeEvent);
 
     eventSource.onerror = (err) => {
       console.error("SSE connection error", err);
@@ -50,6 +59,9 @@ export function useRealtimeUpdates() {
       eventSource.removeEventListener("bot.state", handleBotState);
       eventSource.removeEventListener("portfolio.snapshot", handlePortfolio);
       eventSource.removeEventListener("job.progress", handleJobProgress);
+      eventSource.removeEventListener("trade.opened", handleTradeEvent);
+      eventSource.removeEventListener("trade.updated", handleTradeEvent);
+      eventSource.removeEventListener("trade.closed", handleTradeEvent);
       eventSource.close();
     };
   }, [queryClient]);

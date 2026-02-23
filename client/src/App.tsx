@@ -10,12 +10,14 @@ import { AppLayout } from "@/components/layout/AppLayout";
 import Dashboard from "@/pages/Dashboard";
 import Jobs from "@/pages/Jobs";
 import BotDetail from "@/pages/BotDetail";
+import Trades from "@/pages/Trades";
 
 function Router() {
   return (
     <AppLayout>
       <Switch>
         <Route path="/" component={Dashboard} />
+        <Route path="/trades" component={Trades} />
         <Route path="/jobs" component={Jobs} />
         <Route path="/bots/:id" component={BotDetail} />
         <Route component={NotFound} />

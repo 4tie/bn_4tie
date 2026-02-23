@@ -79,13 +79,18 @@ class Trade(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    bot_id: Mapped[int] = mapped_column(ForeignKey("bots.id", ondelete="CASCADE"), nullable=False, index=True)
+    bot_id: Mapped[int | None] = mapped_column(ForeignKey("bots.id", ondelete="CASCADE"), nullable=True, index=True)
     symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
     side: Mapped[str] = mapped_column(String(8), nullable=False)
     amount: Mapped[float] = mapped_column(Float, nullable=False)
     price: Mapped[float] = mapped_column(Float, nullable=False)
+    cost_basis_quote: Mapped[float] = mapped_column(Float, nullable=False, default=0.0, server_default="0")
+    fees_paid_quote: Mapped[float] = mapped_column(Float, nullable=False, default=0.0, server_default="0")
+    unrealized_pnl_quote: Mapped[float | None] = mapped_column(Float, nullable=True)
+    realized_pnl_quote: Mapped[float | None] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -102,13 +107,18 @@ class Order(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    trade_id: Mapped[int] = mapped_column(ForeignKey("trades.id", ondelete="CASCADE"), nullable=False, index=True)
+    bot_id: Mapped[int | None] = mapped_column(ForeignKey("bots.id", ondelete="SET NULL"), nullable=True, index=True)
+    trade_id: Mapped[int | None] = mapped_column(ForeignKey("trades.id", ondelete="CASCADE"), nullable=True, index=True)
     exchange_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     symbol: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
     side: Mapped[str] = mapped_column(String(8), nullable=False)
     type: Mapped[str] = mapped_column(String(32), nullable=False)
     amount: Mapped[float] = mapped_column(Float, nullable=False)
+    quote_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    base_qty: Mapped[float | None] = mapped_column(Float, nullable=True)
     price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fee_quote: Mapped[float] = mapped_column(Float, nullable=False, default=0.0, server_default="0")
+    paper_mode: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
     status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

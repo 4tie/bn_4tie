@@ -58,7 +58,7 @@ export default function Jobs() {
                       </TableCell>
                       <TableCell className="w-[30%]">
                         <div className="flex items-center gap-3">
-                          <Progress value={job.progress} className="h-2 bg-secondary" indicatorClassName="bg-primary" />
+                          <Progress value={job.progress} className="h-2 bg-secondary" />
                           <span className="text-xs font-numeric text-muted-foreground">{job.progress}%</span>
                         </div>
                       </TableCell>

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 API_BASE="${API_BASE:-http://localhost:8000}"
-SSE_TMP="/tmp/phase1_sse_$$.log"
+SSE_TMP="/tmp/phase2_sse_$$.log"
 
 fail() {
   echo "[FAIL] $*" >&2
@@ -106,7 +106,7 @@ PY
 echo "[OK] created bot id=$BOT_ID"
 
 echo "[INFO] starting SSE capture"
-timeout 20s curl -sN "$API_BASE/sse?bot_id=$BOT_ID" > "$SSE_TMP" &
+timeout 35s curl -sN "$API_BASE/sse?bot_id=$BOT_ID" > "$SSE_TMP" &
 SSE_PID=$!
 sleep 1
 
@@ -142,11 +142,73 @@ done
 
 [ "$SNAPSHOT_OK" = "1" ] || fail "No portfolio snapshot detected for bot $BOT_ID"
 
+echo "[INFO] placing paper buy order"
+ORDER_JSON="$(curl -fsS -X POST "$API_BASE/orders" -H 'Content-Type: application/json' -d "{\"bot_id\":$BOT_ID,\"symbol\":\"BTC/USDT\",\"side\":\"buy\",\"type\":\"market\",\"quote_amount\":100}")" || fail "Buy order failed"
+TRADE_ID="$("$PYTHON_BIN" - <<'PY' "$ORDER_JSON"
+import json, sys
+obj = json.loads(sys.argv[1])
+trade_id = obj.get("trade_id")
+order = obj.get("order") or {}
+if not trade_id:
+    raise SystemExit("[FAIL] buy order response missing trade_id")
+if order.get("side") != "buy":
+    raise SystemExit(f"[FAIL] expected buy order payload, got: {obj}")
+print(trade_id)
+PY
+)"
+echo "[OK] buy order linked trade_id=$TRADE_ID"
+
+echo "[INFO] verifying open trade and unrealized updates"
+OPEN_OK=0
+for _ in $(seq 1 20); do
+  OPEN_JSON="$(curl -fsS "$API_BASE/trades?status=open&bot_id=$BOT_ID")" || true
+  if "$PYTHON_BIN" - <<'PY' "$OPEN_JSON" "$TRADE_ID"
+import json, sys
+rows = json.loads(sys.argv[1] or "[]")
+trade_id = int(sys.argv[2])
+trade = next((row for row in rows if row.get("id") == trade_id), None)
+if not trade:
+    raise SystemExit(1)
+if trade.get("unrealized_pnl_quote") is None:
+    raise SystemExit(2)
+print("[OK] open trade has unrealized_pnl_quote")
+PY
+  then
+    OPEN_OK=1
+    break
+  fi
+  sleep 1
+done
+[ "$OPEN_OK" = "1" ] || fail "Open trade unrealized update was not observed"
+
+echo "[INFO] closing trade by id"
+CLOSE_JSON="$(curl -fsS -X POST "$API_BASE/trades/$TRADE_ID/close")" || fail "Trade close failed"
+"$PYTHON_BIN" - <<'PY' "$CLOSE_JSON" || exit 1
+import json, sys
+obj = json.loads(sys.argv[1])
+trade = obj.get("trade") or {}
+if trade.get("status") != "closed":
+    raise SystemExit(f"[FAIL] trade not closed: {obj}")
+print("[OK] trade close endpoint returned closed trade")
+PY
+
+echo "[INFO] verifying closed trade is listed"
+CLOSED_JSON="$(curl -fsS "$API_BASE/trades?status=closed&bot_id=$BOT_ID")" || fail "Closed trade query failed"
+"$PYTHON_BIN" - <<'PY' "$CLOSED_JSON" "$TRADE_ID" || exit 1
+import json, sys
+rows = json.loads(sys.argv[1])
+trade_id = int(sys.argv[2])
+trade = next((row for row in rows if row.get("id") == trade_id), None)
+if not trade:
+    raise SystemExit("[FAIL] closed trade not found in filtered list")
+print("[OK] closed trade present in list")
+PY
+
 wait "$SSE_PID" || true
 
-for ev in bot.state portfolio.snapshot job.progress; do
+for ev in bot.state portfolio.snapshot job.progress trade.opened trade.updated trade.closed; do
   rg -n "event: $ev" "$SSE_TMP" >/dev/null || fail "SSE stream missing event: $ev"
 done
 
-echo "[OK] SSE contained bot.state, portfolio.snapshot, and job.progress"
+echo "[OK] SSE contained bot.state, portfolio.snapshot, job.progress, trade.opened, trade.updated, trade.closed"
 echo "[PASS] Acceptance checks completed"

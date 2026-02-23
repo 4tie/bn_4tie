@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     artifacts_dir: Path = Field(default=ROOT_DIR / "storage/artifacts", alias="ARTIFACTS_DIR")
     bot_loop_interval_seconds: float = Field(default=5.0, alias="BOT_LOOP_INTERVAL_SECONDS")
     paper_starting_cash: float = Field(default=10000.0, alias="PAPER_STARTING_CASH")
+    paper_fee_rate: float = Field(default=0.001, alias="PAPER_FEE_RATE")
 
     @property
     def sync_database_url(self) -> str:

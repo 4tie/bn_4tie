@@ -19,6 +19,7 @@ const botSchema = z.object({
   timeframe: z.string(),
   paper_mode: z.boolean(),
   strategy: z.string(),
+  strategy_id: z.number().nullable().optional(),
   knobs: knobsSchema,
   status: z.string(),
   stop_requested: z.boolean(),
@@ -28,13 +29,36 @@ const botSchema = z.object({
 
 const tradeSchema = z.object({
   id: z.number(),
-  bot_id: z.number(),
+  bot_id: z.number().nullable(),
   symbol: z.string(),
   side: z.string(),
   amount: z.number(),
   price: z.number(),
+  cost_basis_quote: z.number(),
+  fees_paid_quote: z.number(),
+  unrealized_pnl_quote: z.number().nullable(),
+  realized_pnl_quote: z.number().nullable(),
   status: z.string(),
   pnl: z.number().nullable(),
+  closed_at: z.string().nullable().optional(),
+  created_at: z.string(),
+});
+
+const orderSchema = z.object({
+  id: z.number(),
+  bot_id: z.number().nullable().optional(),
+  trade_id: z.number().nullable().optional(),
+  exchange_id: z.string().nullable().optional(),
+  symbol: z.string(),
+  side: z.string(),
+  type: z.string(),
+  amount: z.number(),
+  quote_amount: z.number().nullable().optional(),
+  base_qty: z.number().nullable().optional(),
+  price: z.number().nullable().optional(),
+  fee_quote: z.number(),
+  paper_mode: z.boolean(),
+  status: z.string(),
   created_at: z.string(),
 });
 
@@ -79,18 +103,38 @@ const stopBotResponseSchema = z.object({
   status: z.string(),
 });
 
+const orderExecutionSchema = z.object({
+  order: orderSchema,
+  trade_id: z.number().nullable().optional(),
+});
+
+const tradeCloseSchema = z.object({
+  trade: tradeSchema,
+  order: orderSchema,
+});
+
 const createBotSchema = z.object({
   name: z.string().min(1),
   symbols: z.array(z.string().min(3)).min(1),
   timeframe: z.string().min(1),
   paper_mode: z.literal(true),
-  strategy: z.string().min(1),
+  strategy: z.string().optional(),
   knobs: knobsSchema,
 });
 
 const updateKnobsSchema = z.object({
   id: z.number(),
   knobs: knobsSchema,
+});
+
+const createOrderSchema = z.object({
+  bot_id: z.number().optional(),
+  symbol: z.string().min(3),
+  side: z.enum(["buy", "sell"]),
+  type: z.literal("market").default("market"),
+  quote_amount: z.number().positive().optional(),
+  base_qty: z.number().positive().optional(),
+  paper_mode: z.boolean().optional(),
 });
 
 async function fetcher<T>(url: string, schema?: z.ZodType<T>): Promise<T> {
@@ -141,16 +185,26 @@ export function useBot(id: number) {
   });
 }
 
-export function useTrades(status?: string) {
+export function useTrades(status?: "open" | "closed", botId?: number) {
   return useQuery({
-    queryKey: ["/api/trades", status ?? "all"],
+    queryKey: ["/api/trades", status ?? "all", botId ?? "all"],
     queryFn: () => {
       const url = new URL(apiUrl("/api/trades"), window.location.origin);
       if (status) {
         url.searchParams.set("status", status);
       }
+      if (typeof botId === "number" && botId > 0) {
+        url.searchParams.set("bot_id", String(botId));
+      }
       return fetcher(url.toString(), z.array(tradeSchema));
     },
+  });
+}
+
+export function useOrders() {
+  return useQuery({
+    queryKey: ["/api/orders"],
+    queryFn: () => fetcher(apiUrl("/api/orders"), z.array(orderSchema)),
   });
 }
 
@@ -182,10 +236,45 @@ export function useCreateBot() {
   return useMutation({
     mutationFn: (data: z.infer<typeof createBotSchema>) => {
       const validated = createBotSchema.parse(data);
-      return mutator(apiUrl("/api/bots"), "POST", validated, botSchema);
+      const strategy = validated.strategy?.trim();
+      const payload = {
+        ...validated,
+        ...(strategy ? { strategy } : {}),
+      };
+      return mutator(apiUrl("/api/bots"), "POST", payload, botSchema);
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/bots"] });
+    },
+  });
+}
+
+export function useCreateOrder() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (data: z.infer<typeof createOrderSchema>) => {
+      const validated = createOrderSchema.parse(data);
+      return mutator(apiUrl("/api/orders"), "POST", validated, orderExecutionSchema);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/trades"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/orders"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/portfolio"] });
+    },
+  });
+}
+
+export function useCloseTrade() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (tradeId: number) =>
+      mutator(apiUrl(`/api/trades/${tradeId}/close`), "POST", undefined, tradeCloseSchema),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/trades"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/orders"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/portfolio"] });
     },
   });
 }

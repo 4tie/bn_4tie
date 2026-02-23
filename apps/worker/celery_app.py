@@ -9,10 +9,10 @@ from typing import Any
 import ccxt
 import redis
 from celery import Celery
-from sqlalchemy import and_, desc, select
+from sqlalchemy import and_, asc, desc, select
 
 from packages.core.database import SessionLocal
-from packages.core.models import Bot, Job, PortfolioSnapshot
+from packages.core.models import Bot, Job, PortfolioSnapshot, Trade
 from packages.core.settings import Settings, get_settings
 
 
@@ -31,10 +31,10 @@ celery_app.conf.update(
     task_track_started=True,
 )
 
-redis_client = redis.from_url(_settings().redis_url, decode_responses=True)
-
 # Allows `celery -A apps.worker.celery_app worker ...` from repo root.
 app = celery_app
+
+redis_client = redis.from_url(_settings().redis_url, decode_responses=True)
 
 
 def _utc_now() -> datetime:
@@ -58,23 +58,6 @@ def _fetch_tickers(symbols: list[str]) -> dict[str, Any]:
         close_method = getattr(exchange, "close", None)
         if callable(close_method):
             close_method()
-
-
-def _latest_cash(bot_id: int) -> float:
-    with SessionLocal() as session:
-        latest = (
-            session.execute(
-                select(PortfolioSnapshot)
-                .where(PortfolioSnapshot.bot_id == bot_id)
-                .order_by(desc(PortfolioSnapshot.timestamp))
-                .limit(1)
-            )
-            .scalars()
-            .first()
-        )
-        if latest:
-            return float(latest.cash)
-        return float(_settings().paper_starting_cash)
 
 
 def _find_or_create_job(session: Any, bot_id: int, task_name: str, celery_task_id: str | None) -> Job:
@@ -111,6 +94,20 @@ def _find_or_create_job(session: Any, bot_id: int, task_name: str, celery_task_i
     session.add(job)
     session.flush()
     return job
+
+
+def _resolve_fee_rate(bot: Bot) -> float:
+    default_fee = float(_settings().paper_fee_rate)
+    if not isinstance(bot.knobs, dict):
+        return default_fee
+    raw = bot.knobs.get("fee_rate")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default_fee
+    if value < 0:
+        return default_fee
+    return value
 
 
 @celery_app.task(name="bot_run_loop", bind=True)
@@ -241,18 +238,72 @@ def bot_run_loop(self: Any, bot_id: int) -> dict[str, Any]:
                 time.sleep(interval_seconds)
                 continue
 
-            last_prices: dict[str, float] = {}
-            for symbol in symbols:
-                ticker = tickers.get(symbol) or {}
-                last = ticker.get("last") or ticker.get("close")
-                if last is not None:
-                    last_prices[symbol] = float(last)
-
-            cash = _latest_cash(bot_id)
-            positions_value = 0.0
-            equity = float(cash + positions_value)
-
             with SessionLocal() as session:
+                bot = session.get(Bot, bot_id)
+                fee_rate = _resolve_fee_rate(bot) if bot else float(_settings().paper_fee_rate)
+
+                open_trades = (
+                    session.execute(
+                        select(Trade)
+                        .where(Trade.bot_id == bot_id, Trade.status == "open")
+                        .order_by(asc(Trade.created_at))
+                    )
+                    .scalars()
+                    .all()
+                )
+                closed_trades = (
+                    session.execute(
+                        select(Trade)
+                        .where(Trade.bot_id == bot_id, Trade.status == "closed")
+                        .order_by(asc(Trade.created_at))
+                    )
+                    .scalars()
+                    .all()
+                )
+
+                positions_value = 0.0
+                open_locked_cost = 0.0
+                realized_closed = 0.0
+
+                last_prices: dict[str, float] = {}
+                trade_updates: list[dict[str, Any]] = []
+                for symbol in symbols:
+                    ticker = tickers.get(symbol) or {}
+                    last = ticker.get("last") or ticker.get("close")
+                    if last is not None:
+                        last_prices[symbol] = float(last)
+
+                for trade in open_trades:
+                    mark_price = last_prices.get(trade.symbol)
+                    if mark_price is None:
+                        continue
+
+                    mark_value = float(trade.amount * mark_price)
+                    unrealized = float(mark_value - (trade.cost_basis_quote or 0.0) - (trade.fees_paid_quote or 0.0))
+
+                    trade.unrealized_pnl_quote = unrealized
+                    trade.pnl = unrealized
+
+                    positions_value += mark_value
+                    open_locked_cost += float((trade.cost_basis_quote or 0.0) + (trade.fees_paid_quote or 0.0))
+
+                    trade_updates.append(
+                        {
+                            "bot_id": bot_id,
+                            "trade_id": trade.id,
+                            "symbol": trade.symbol,
+                            "price": mark_price,
+                            "unrealized_pnl_quote": unrealized,
+                            "ts": _utc_now().isoformat(),
+                        }
+                    )
+
+                for trade in closed_trades:
+                    realized_closed += float(trade.realized_pnl_quote or 0.0)
+
+                cash = float(_settings().paper_starting_cash + realized_closed - open_locked_cost)
+                equity = float(cash + positions_value)
+
                 snapshot = PortfolioSnapshot(
                     bot_id=bot_id,
                     equity=equity,
@@ -274,6 +325,9 @@ def bot_run_loop(self: Any, bot_id: int) -> dict[str, Any]:
                 session.commit()
                 session.refresh(snapshot)
 
+            for update in trade_updates:
+                _publish_event("trade.updated", update)
+
             _publish_event(
                 "portfolio.snapshot",
                 {
@@ -283,6 +337,7 @@ def bot_run_loop(self: Any, bot_id: int) -> dict[str, Any]:
                     "positions_value": positions_value,
                     "ts": snapshot.timestamp.isoformat(),
                     "prices": last_prices,
+                    "fee_rate": fee_rate,
                 },
             )
 
