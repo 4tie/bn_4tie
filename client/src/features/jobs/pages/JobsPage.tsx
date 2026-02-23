@@ -5,7 +5,7 @@ import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { formatDistanceToNow } from "date-fns";
 
-export default function JobsPage() {
+export default function Jobs() {
   const { data: jobs, isLoading, isError, error } = useJobs();
 
   return (

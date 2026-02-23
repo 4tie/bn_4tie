@@ -12,11 +12,10 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Wallet, TrendingUp, Activity, BarChart3, Bot as BotIcon, ExternalLink } from "lucide-react";
-import { CreateBotDialog } from "@/features/dashboard/components/CreateBotDialog";
+import { CreateBotDialog } from "@/components/CreateBotDialog";
 import { Link } from "wouter";
-import { formatCurrency, formatPercent } from "@/lib/format";
 
-export default function DashboardPage() {
+export default function Dashboard() {
   const {
     data: portfolio,
     isLoading: pLoading,
@@ -37,6 +36,11 @@ export default function DashboardPage() {
     }
     startBot.mutate(botId);
   };
+
+  const formatCurrency = (val: number) =>
+    new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(Number(val));
+
+  const formatPercent = (val: number) => `${val > 0 ? "+" : ""}${val.toFixed(2)}%`;
 
   return (
     <div className="space-y-6">

@@ -1,6 +1,5 @@
 import { useMemo, useState } from "react";
 import {
-  Trade,
   useBots,
   useCloseTrade,
   useCreateOrder,
@@ -23,7 +22,6 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
-import { formatCurrency } from "@/lib/format";
 
 type OrderSide = "buy" | "sell";
 
@@ -34,12 +32,19 @@ function TradeRows({
   onClose,
   closePending,
 }: {
-  rows: Trade[] | undefined;
+  rows: any[] | undefined;
   loading: boolean;
   error: unknown;
   onClose: (tradeId: number) => void;
   closePending: boolean;
 }) {
+  const fmtCurrency = (value: number | null | undefined) => {
+    if (value == null) {
+      return "-";
+    }
+    return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(value);
+  };
+
   if (loading) {
     return (
       <TableRow>
@@ -78,14 +83,14 @@ function TradeRows({
           <TableCell>{trade.bot_id == null ? "-" : `#${trade.bot_id}`}</TableCell>
           <TableCell className="font-medium">{trade.symbol}</TableCell>
           <TableCell className="text-right font-numeric">{trade.amount.toFixed(8)}</TableCell>
-          <TableCell className="text-right font-numeric">{formatCurrency(trade.price)}</TableCell>
+          <TableCell className="text-right font-numeric">{fmtCurrency(trade.price)}</TableCell>
           <TableCell className={`text-right font-numeric ${Number(trade.unrealized_pnl_quote ?? 0) >= 0 ? "text-success" : "text-danger"}`}>
-            {formatCurrency(trade.unrealized_pnl_quote)}
+            {fmtCurrency(trade.unrealized_pnl_quote)}
           </TableCell>
           <TableCell className={`text-right font-numeric ${Number(trade.realized_pnl_quote ?? 0) >= 0 ? "text-success" : "text-danger"}`}>
-            {formatCurrency(trade.realized_pnl_quote)}
+            {fmtCurrency(trade.realized_pnl_quote)}
           </TableCell>
-          <TableCell className="text-right font-numeric">{formatCurrency(trade.fees_paid_quote)}</TableCell>
+          <TableCell className="text-right font-numeric">{fmtCurrency(trade.fees_paid_quote)}</TableCell>
           <TableCell>
             <Badge variant="outline" className="border-border/50 text-xs">
               {trade.status}
@@ -106,7 +111,7 @@ function TradeRows({
   );
 }
 
-export default function TradesPage() {
+export default function Trades() {
   const { toast } = useToast();
   const { data: bots } = useBots();
   const openTrades = useTrades("open");
