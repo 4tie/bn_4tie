@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sys
 from logging.config import fileConfig
 from pathlib import Path
@@ -13,6 +12,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from packages.core.models import Base
+from packages.core.settings import get_settings
 
 config = context.config
 
@@ -24,9 +24,10 @@ target_metadata = Base.metadata
 
 
 def _database_url() -> str:
-    url = os.getenv("DATABASE_URL")
-    if not url:
-        raise RuntimeError("DATABASE_URL is required for Alembic migrations")
+    try:
+        url = get_settings().sync_database_url
+    except RuntimeError as exc:
+        raise RuntimeError(f"Alembic configuration error: {exc}") from exc
 
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
@@ -34,9 +35,21 @@ def _database_url() -> str:
     return url
 
 
+def _sync_alembic_config_url_from_env() -> str:
+    """
+    Keep alembic.ini interpolation (%(DATABASE_URL)s) aligned with runtime env.
+    """
+    database_url = _database_url()
+    escaped = database_url.replace("%", "%%")
+    config.set_main_option("DATABASE_URL", escaped)
+    config.set_main_option("sqlalchemy.url", escaped)
+    return database_url
+
+
 def run_migrations_offline() -> None:
+    database_url = _sync_alembic_config_url_from_env()
     context.configure(
-        url=_database_url(),
+        url=database_url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -48,7 +61,8 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    connectable = create_engine(_database_url(), poolclass=pool.NullPool)
+    database_url = _sync_alembic_config_url_from_env()
+    connectable = create_engine(database_url, poolclass=pool.NullPool)
 
     with connectable.connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)

@@ -21,7 +21,6 @@ class BotBase(BaseModel):
     symbols: list[str] = Field(min_length=1)
     timeframe: str = Field(min_length=1, max_length=20)
     paper_mode: Literal[True] = True
-    strategy: str = Field(min_length=1, max_length=120)
     knobs: Knobs
 
     @field_validator("symbols")
@@ -39,13 +38,25 @@ class BotBase(BaseModel):
 
 
 class BotCreate(BotBase):
-    pass
+    strategy: str | None = Field(default=None, max_length=120)
+
+    @field_validator("strategy")
+    @classmethod
+    def normalize_optional_strategy(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        return normalized
 
 
 class BotRead(BotBase):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    strategy: str
+    strategy_id: int | None = None
     status: str
     stop_requested: bool
     created_at: datetime

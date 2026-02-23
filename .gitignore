@@ -10,6 +10,7 @@ __pycache__/
 .venv/
 .local/state/
 *.egg-info/
+.env
 
 # never commit private keys
 fg

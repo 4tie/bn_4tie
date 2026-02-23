@@ -4,6 +4,7 @@ import asyncio
 import json
 from collections.abc import AsyncGenerator
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib import error as urlerror
@@ -19,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.database import get_db
 from apps.worker.celery_app import celery_app
-from packages.core.models import Bot, Job, Order, PortfolioSnapshot, Trade
+from packages.core.models import Bot, Job, Order, PortfolioSnapshot, Strategy, Trade
 from packages.core.schemas import (
     BotCreate,
     BotKnobsUpdate,
@@ -34,9 +35,7 @@ from packages.core.schemas import (
     PortfolioSnapshotRead,
     TradeRead,
 )
-from packages.core.settings import get_settings
-
-settings = get_settings()
+from packages.core.settings import Settings, get_settings
 
 app = FastAPI(title="Local-First Binance Bot API", version="1.0.0")
 router = APIRouter()
@@ -48,6 +47,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@lru_cache(maxsize=1)
+def _settings() -> Settings:
+    return get_settings()
 
 
 def _serialize_json(value: Any) -> str:
@@ -128,7 +132,7 @@ def _fetch_binance_ohlcv(symbol: str, timeframe: str, limit: int) -> list[list[f
 
 
 def _ollama_get(path: str) -> tuple[int, dict[str, Any]]:
-    base = settings.ollama_base_url.rstrip("/")
+    base = _settings().ollama_base_url.rstrip("/")
     req = urlrequest.Request(f"{base}{path}", headers={"Accept": "application/json"})
     with urlrequest.urlopen(req, timeout=5) as response:
         body = response.read().decode("utf-8")
@@ -141,7 +145,7 @@ async def _redis_sse_stream(
     bot_id: int | None,
     job_id: int | None,
 ) -> AsyncGenerator[dict[str, str], None]:
-    client = redis.from_url(settings.redis_url, decode_responses=True)
+    client = redis.from_url(_settings().redis_url, decode_responses=True)
     pubsub = client.pubsub()
 
     await pubsub.subscribe("events")
@@ -194,7 +198,7 @@ async def _redis_sse_stream(
 
 @app.on_event("startup")
 async def startup() -> None:
-    Path(settings.artifacts_dir).mkdir(parents=True, exist_ok=True)
+    Path(_settings().artifacts_dir).mkdir(parents=True, exist_ok=True)
 
 
 @router.get("/health")
@@ -208,14 +212,14 @@ async def health(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
         checks["db"] = {"ok": False, "error": str(exc)}
 
     try:
-        redis_client = redis.from_url(settings.redis_url)
+        redis_client = redis.from_url(_settings().redis_url)
         await redis_client.ping()
         await redis_client.aclose()
         checks["redis"] = {"ok": True}
     except Exception as exc:  # pragma: no cover - runtime dependent
         checks["redis"] = {"ok": False, "error": str(exc)}
 
-    artifacts_path = Path(settings.artifacts_dir)
+    artifacts_path = Path(_settings().artifacts_dir)
     checks["artifacts"] = {
         "ok": artifacts_path.exists() and artifacts_path.is_dir(),
         "path": str(artifacts_path),
@@ -291,24 +295,55 @@ async def ai_health() -> dict[str, Any]:
             "status": "ok" if status_code < 400 else "error",
             "http_status": status_code,
             "models_count": len(payload.get("models", [])) if isinstance(payload.get("models"), list) else None,
-            "base_url": settings.ollama_base_url,
+            "base_url": _settings().ollama_base_url,
         }
     except Exception as exc:  # pragma: no cover - runtime dependent
         return {
             "status": "error",
-            "base_url": settings.ollama_base_url,
+            "base_url": _settings().ollama_base_url,
             "error": str(exc),
         }
 
 
+async def _resolve_strategy_for_bot_create(db: AsyncSession, requested_strategy: str | None) -> Strategy:
+    if requested_strategy:
+        normalized_name = requested_strategy.strip()
+        strategy_query = (
+            select(Strategy)
+            .where(Strategy.name == normalized_name)
+            .order_by(desc(Strategy.version))
+            .limit(1)
+        )
+        existing = (await db.execute(strategy_query)).scalars().first()
+        if existing:
+            return existing
+
+        strategy = Strategy(name=normalized_name, version=1, description=None)
+        db.add(strategy)
+        await db.flush()
+        return strategy
+
+    baseline_query = select(Strategy).where(Strategy.name == "baseline", Strategy.version == 1).limit(1)
+    baseline = (await db.execute(baseline_query)).scalars().first()
+    if baseline:
+        return baseline
+
+    baseline = Strategy(name="baseline", version=1, description="Phase 1 default strategy")
+    db.add(baseline)
+    await db.flush()
+    return baseline
+
+
 @router.post("/bots", response_model=BotRead, status_code=201)
 async def create_bot(payload: BotCreate, db: AsyncSession = Depends(get_db)) -> BotRead:
+    resolved_strategy = await _resolve_strategy_for_bot_create(db, payload.strategy)
+
     bot = Bot(
         name=payload.name,
         symbols=payload.symbols,
         timeframe=payload.timeframe,
         paper_mode=payload.paper_mode,
-        strategy=payload.strategy,
+        strategy=resolved_strategy.name,
         knobs=payload.knobs.model_dump(),
         status="stopped",
         stop_requested=False,
@@ -316,7 +351,8 @@ async def create_bot(payload: BotCreate, db: AsyncSession = Depends(get_db)) -> 
     db.add(bot)
     await db.commit()
     await db.refresh(bot)
-    return BotRead.model_validate(bot)
+    bot_response = BotRead.model_validate(bot)
+    return bot_response.model_copy(update={"strategy_id": resolved_strategy.id})
 
 
 @router.get("/bots", response_model=list[BotRead])

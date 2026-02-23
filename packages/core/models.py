@@ -56,9 +56,13 @@ class Bot(Base):
 
 class Strategy(Base):
     __tablename__ = "strategies"
+    __table_args__ = (
+        Index("ix_strategies_name_version", "name", "version", unique=True),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(String(120), nullable=False, unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

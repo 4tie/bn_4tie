@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any
 
 import ccxt
@@ -12,11 +13,15 @@ from sqlalchemy import and_, desc, select
 
 from packages.core.database import SessionLocal
 from packages.core.models import Bot, Job, PortfolioSnapshot
-from packages.core.settings import get_settings
+from packages.core.settings import Settings, get_settings
 
-settings = get_settings()
 
-celery_app = Celery("binance_bot_worker", broker=settings.redis_url, backend=settings.redis_url)
+@lru_cache(maxsize=1)
+def _settings() -> Settings:
+    return get_settings()
+
+
+celery_app = Celery("binance_bot_worker", broker=_settings().redis_url, backend=_settings().redis_url)
 celery_app.conf.update(
     task_serializer="json",
     accept_content=["json"],
@@ -26,7 +31,10 @@ celery_app.conf.update(
     task_track_started=True,
 )
 
-redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+redis_client = redis.from_url(_settings().redis_url, decode_responses=True)
+
+# Allows `celery -A apps.worker.celery_app worker ...` from repo root.
+app = celery_app
 
 
 def _utc_now() -> datetime:
@@ -66,7 +74,7 @@ def _latest_cash(bot_id: int) -> float:
         )
         if latest:
             return float(latest.cash)
-        return float(settings.paper_starting_cash)
+        return float(_settings().paper_starting_cash)
 
 
 def _find_or_create_job(session: Any, bot_id: int, task_name: str, celery_task_id: str | None) -> Job:
@@ -107,7 +115,7 @@ def _find_or_create_job(session: Any, bot_id: int, task_name: str, celery_task_i
 
 @celery_app.task(name="bot_run_loop", bind=True)
 def bot_run_loop(self: Any, bot_id: int) -> dict[str, Any]:
-    interval_seconds = max(float(settings.bot_loop_interval_seconds), 1.0)
+    interval_seconds = max(float(_settings().bot_loop_interval_seconds), 1.0)
     iteration = 0
     job_id: int | None = None
 
