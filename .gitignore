@@ -10,3 +10,7 @@ __pycache__/
 .venv/
 .local/state/
 *.egg-info/
+
+# never commit private keys
+fg
+fg.pub
