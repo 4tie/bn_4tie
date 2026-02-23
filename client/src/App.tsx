@@ -1,37 +1,18 @@
-import { Switch, Route } from "wouter";
-import { queryClient } from "./lib/queryClient";
 import { QueryClientProvider } from "@tanstack/react-query";
+import { queryClient } from "./lib/queryClient";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import NotFound from "@/pages/not-found";
-
-// App Components
 import { AppLayout } from "@/components/layout/AppLayout";
-import Dashboard from "@/pages/Dashboard";
-import Jobs from "@/pages/Jobs";
-import BotDetail from "@/pages/BotDetail";
-import Trades from "@/pages/Trades";
-
-function Router() {
-  return (
-    <AppLayout>
-      <Switch>
-        <Route path="/" component={Dashboard} />
-        <Route path="/trades" component={Trades} />
-        <Route path="/jobs" component={Jobs} />
-        <Route path="/bots/:id" component={BotDetail} />
-        <Route component={NotFound} />
-      </Switch>
-    </AppLayout>
-  );
-}
+import { AppRoutes } from "@/app/routes";
 
 function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
         <Toaster />
-        <Router />
+        <AppLayout>
+          <AppRoutes />
+        </AppLayout>
       </TooltipProvider>
     </QueryClientProvider>
   );

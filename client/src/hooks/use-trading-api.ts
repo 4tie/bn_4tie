@@ -90,6 +90,15 @@ const jobSchema = z.object({
   updated_at: z.string(),
 });
 
+const healthSchema = z.object({
+  status: z.string(),
+  checks: z.object({
+    db: z.object({ ok: z.boolean(), error: z.string().optional() }),
+    redis: z.object({ ok: z.boolean(), error: z.string().optional() }),
+    artifacts: z.object({ ok: z.boolean(), path: z.string().optional() }),
+  }),
+});
+
 const startBotResponseSchema = z.object({
   bot_id: z.number(),
   job_id: z.number(),
@@ -136,6 +145,14 @@ const createOrderSchema = z.object({
   base_qty: z.number().positive().optional(),
   paper_mode: z.boolean().optional(),
 });
+
+export type Bot = z.infer<typeof botSchema>;
+export type Trade = z.infer<typeof tradeSchema>;
+export type Order = z.infer<typeof orderSchema>;
+export type PortfolioSnapshot = z.infer<typeof portfolioSchema>;
+export type Ticker = z.infer<typeof tickerSchema>;
+export type Job = z.infer<typeof jobSchema>;
+export type Health = z.infer<typeof healthSchema>;
 
 async function fetcher<T>(url: string, schema?: z.ZodType<T>): Promise<T> {
   const res = await fetch(url, { credentials: "include" });
@@ -227,6 +244,14 @@ export function useJobs() {
   return useQuery({
     queryKey: ["/api/jobs"],
     queryFn: () => fetcher(apiUrl("/api/jobs"), z.array(jobSchema)),
+  });
+}
+
+export function useHealth() {
+  return useQuery({
+    queryKey: ["/api/health"],
+    queryFn: () => fetcher(apiUrl("/api/health"), healthSchema),
+    refetchInterval: 10000,
   });
 }
 

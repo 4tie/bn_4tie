@@ -9,14 +9,28 @@ import { Badge } from "@/components/ui/badge";
 import { ArrowLeft, Save, Settings2 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 
-export default function BotDetail() {
+type BotKnobs = {
+  max_open_trades: number;
+  stake_amount: number;
+  stop_loss_pct: number;
+  take_profit_pct: number;
+  cooldown_minutes: number;
+};
+
+export default function BotDetailPage() {
   const { id } = useParams();
   const botId = parseInt(id || "0", 10);
   const { data: bot, isLoading } = useBot(botId);
   const updateKnobs = useUpdateBotKnobs();
   const { toast } = useToast();
 
-  const [knobs, setKnobs] = useState<any>({});
+  const [knobs, setKnobs] = useState<BotKnobs>({
+    max_open_trades: 3,
+    stake_amount: 100,
+    stop_loss_pct: 5,
+    take_profit_pct: 10,
+    cooldown_minutes: 60,
+  });
 
   useEffect(() => {
     if (bot?.knobs) {
@@ -36,8 +50,8 @@ export default function BotDetail() {
     });
   };
 
-  const handleChange = (key: string, value: string) => {
-    setKnobs((prev: any) => ({ ...prev, [key]: Number(value) }));
+  const handleChange = (key: keyof BotKnobs, value: string) => {
+    setKnobs((prev) => ({ ...prev, [key]: Number(value) }));
   };
 
   if (isLoading) return <div className="p-8 text-center text-muted-foreground">Loading bot config...</div>;
